@@ -1,0 +1,43 @@
+[package]
+name = "qqshark"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+pcap = "2"
+
+# 彩色 TUI（与 ../x_key_scanner 同款配色栈）
+anstream = "0.6"
+anstyle = "1"
+
+# login.db (SQLCipher v4) 解密：纯 RustCrypto，不引入 openssl
+sha1 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+aes = "0.8"
+cbc = "0.1"
+md-5 = "0.10"
+hex = "0.4"
+
+# 读取解密后的 login.db（纯 bundled SQLite，无 sqlcipher）
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# 跨平台 pid 探测（Windows 实现已写入仓库，等待未来在 Windows 上适配）。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_RestartManager",
+    "Win32_Security",
+] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true
