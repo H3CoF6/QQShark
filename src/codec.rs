@@ -31,7 +31,11 @@ pub enum RvValue {
     /// 文本：JCE STRING1/STRING4。
     Str { text: String, bytes: Vec<u8> },
     /// 原始字节：protobuf LEN / JCE SIMPLE_LIST。可含自动下钻的嵌套树。
-    Bytes { bytes: Vec<u8>, nested: Option<Vec<RvNode>>, nested_kind: Option<Kind> },
+    Bytes {
+        bytes: Vec<u8>,
+        nested: Option<Vec<RvNode>>,
+        nested_kind: Option<Kind>,
+    },
     /// 嵌套对象：protobuf 嵌套消息 / JCE STRUCT。
     Obj(Vec<RvNode>),
     /// JCE LIST。
@@ -89,14 +93,26 @@ pub fn two_complement(raw: u64, bits: u8) -> i64 {
         return raw as i64;
     }
     let sign = 1u64 << (bits - 1);
-    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let mask = if bits == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
     let m = raw & mask;
-    if m >= sign { (m as i128 - (1i128 << bits)) as i64 } else { m as i64 }
+    if m >= sign {
+        (m as i128 - (1i128 << bits)) as i64
+    } else {
+        m as i64
+    }
 }
 
 /// int 节点默认展示值。
 pub fn rv_int_display(raw: u64, bits: u8, signed: bool) -> i64 {
-    if signed && bits > 0 { two_complement(raw, bits) } else { raw as i64 }
+    if signed && bits > 0 {
+        two_complement(raw, bits)
+    } else {
+        raw as i64
+    }
 }
 
 /// zigzag 解码（保留给未来的 sint 语义切换展示）。
@@ -155,13 +171,21 @@ fn read_field(buf: &[u8], off: usize) -> Option<WireField<'_>> {
     match wire {
         0 => {
             let (_, n) = read_varint(buf, cursor)?;
-            Some(WireField { tag, wire, payload: &buf[cursor..cursor + n] })
+            Some(WireField {
+                tag,
+                wire,
+                payload: &buf[cursor..cursor + n],
+            })
         }
         1 => {
             if cursor + 8 > buf.len() {
                 return None;
             }
-            Some(WireField { tag, wire, payload: &buf[cursor..cursor + 8] })
+            Some(WireField {
+                tag,
+                wire,
+                payload: &buf[cursor..cursor + 8],
+            })
         }
         2 => {
             let (len, ls) = read_varint(buf, cursor)?;
@@ -170,13 +194,21 @@ fn read_field(buf: &[u8], off: usize) -> Option<WireField<'_>> {
             if start + len > buf.len() {
                 return None;
             }
-            Some(WireField { tag, wire, payload: &buf[start..start + len] })
+            Some(WireField {
+                tag,
+                wire,
+                payload: &buf[start..start + len],
+            })
         }
         5 => {
             if cursor + 4 > buf.len() {
                 return None;
             }
-            Some(WireField { tag, wire, payload: &buf[cursor..cursor + 4] })
+            Some(WireField {
+                tag,
+                wire,
+                payload: &buf[cursor..cursor + 4],
+            })
         }
         _ => None,
     }
@@ -192,18 +224,36 @@ pub fn decode_protobuf(buf: &[u8], depth: usize) -> Result<Vec<RvNode>, DecodeEr
         let value = match wf.wire {
             0 => {
                 let (v, _) = read_varint(wf.payload, 0).ok_or(err!("protobuf: varint"))?;
-                RvValue::Int { raw: v, bits: 0, signed: false }
+                RvValue::Int {
+                    raw: v,
+                    bits: 0,
+                    signed: false,
+                }
             }
-            1 => RvValue::Fixed { bytes: wf.payload.to_vec(), bits: 64 },
+            1 => RvValue::Fixed {
+                bytes: wf.payload.to_vec(),
+                bits: 64,
+            },
             2 => {
                 let payload = wf.payload.to_vec();
-                let mut value = RvValue::Bytes { bytes: payload.clone(), nested: None, nested_kind: None };
+                let mut value = RvValue::Bytes {
+                    bytes: payload.clone(),
+                    nested: None,
+                    nested_kind: None,
+                };
                 if let Some((nested, kind)) = nested_bytes(&payload, depth) {
-                    value = RvValue::Bytes { bytes: payload, nested: Some(nested), nested_kind: Some(kind) };
+                    value = RvValue::Bytes {
+                        bytes: payload,
+                        nested: Some(nested),
+                        nested_kind: Some(kind),
+                    };
                 }
                 value
             }
-            5 => RvValue::Fixed { bytes: wf.payload.to_vec(), bits: 32 },
+            5 => RvValue::Fixed {
+                bytes: wf.payload.to_vec(),
+                bits: 32,
+            },
             _ => return Err(err!("protobuf: 不支持的 wire type")),
         };
         nodes.push(RvNode { tag: wf.tag, value });
@@ -305,7 +355,10 @@ impl<'a> JceReader<'a> {
         let mut tag = ((b >> 4) & 0x0f) as u32;
         let mut head_size = 1;
         if tag == 15 {
-            tag = *self.buf.get(self.pos + 1).ok_or(err!("JCE: 扩展 tag 截断"))? as u32;
+            tag = *self
+                .buf
+                .get(self.pos + 1)
+                .ok_or(err!("JCE: 扩展 tag 截断"))? as u32;
             head_size = 2;
         }
         self.pos += head_size;
@@ -430,7 +483,10 @@ impl<'a> JceReader<'a> {
                 break;
             }
             let value = self.read_value(head.ty)?;
-            nodes.push(RvNode { tag: head.tag, value });
+            nodes.push(RvNode {
+                tag: head.tag,
+                value,
+            });
         }
         Ok(nodes)
     }
@@ -438,27 +494,53 @@ impl<'a> JceReader<'a> {
     fn read_value(&mut self, ty: u8) -> Result<RvValue, DecodeError> {
         use jce_type::*;
         Ok(match ty {
-            BYTE => RvValue::Int { raw: self.read_u8()? as u64, bits: 8, signed: true },
-            SHORT => RvValue::Int { raw: self.read_u16()? as u64, bits: 16, signed: true },
-            INT => RvValue::Int { raw: self.read_u32()? as u64, bits: 32, signed: true },
-            LONG => RvValue::Int { raw: self.read_u64()?, bits: 64, signed: true },
+            BYTE => RvValue::Int {
+                raw: self.read_u8()? as u64,
+                bits: 8,
+                signed: true,
+            },
+            SHORT => RvValue::Int {
+                raw: self.read_u16()? as u64,
+                bits: 16,
+                signed: true,
+            },
+            INT => RvValue::Int {
+                raw: self.read_u32()? as u64,
+                bits: 32,
+                signed: true,
+            },
+            LONG => RvValue::Int {
+                raw: self.read_u64()?,
+                bits: 64,
+                signed: true,
+            },
             FLOAT => RvValue::Float(self.read_f32()? as f64),
             DOUBLE => RvValue::Float(self.read_f64()?),
             STRING1 => {
                 let len = self.read_u8()? as usize;
                 let bytes = self.read_bytes(len)?;
-                RvValue::Str { text: decode_utf8_lossy(&bytes), bytes }
+                RvValue::Str {
+                    text: decode_utf8_lossy(&bytes),
+                    bytes,
+                }
             }
             STRING4 => {
                 let len = self.read_u32()? as usize;
                 let bytes = self.read_bytes(len)?;
-                RvValue::Str { text: decode_utf8_lossy(&bytes), bytes }
+                RvValue::Str {
+                    text: decode_utf8_lossy(&bytes),
+                    bytes,
+                }
             }
             MAP => self.read_map()?,
             LIST => self.read_list()?,
             STRUCT_BEGIN => RvValue::Obj(self.read_struct()?),
             STRUCT_END => return Err(err!("JCE: 意外的 STRUCT_END")),
-            ZERO_TAG => RvValue::Int { raw: 0, bits: 0, signed: false },
+            ZERO_TAG => RvValue::Int {
+                raw: 0,
+                bits: 0,
+                signed: false,
+            },
             SIMPLE_LIST => self.read_simple_list()?,
             _ => return Err(err!("JCE: 未知类型")),
         })
@@ -472,7 +554,10 @@ impl<'a> JceReader<'a> {
                 break;
             }
             let value = self.read_value(head.ty)?;
-            fields.push(RvNode { tag: head.tag, value });
+            fields.push(RvNode {
+                tag: head.tag,
+                value,
+            });
         }
         Ok(fields)
     }
@@ -484,7 +569,10 @@ impl<'a> JceReader<'a> {
         for _ in 0..size {
             let head = self.read_head()?;
             let value = self.read_value(head.ty)?;
-            items.push(RvNode { tag: head.tag, value });
+            items.push(RvNode {
+                tag: head.tag,
+                value,
+            });
         }
         Ok(RvValue::List(items))
     }
@@ -516,7 +604,11 @@ impl<'a> JceReader<'a> {
             Some((n, k)) => (Some(n), Some(k)),
             None => (None, None),
         };
-        Ok(RvValue::Bytes { bytes, nested, nested_kind })
+        Ok(RvValue::Bytes {
+            bytes,
+            nested,
+            nested_kind,
+        })
     }
 }
 
@@ -565,8 +657,11 @@ pub fn detect_length_prefixes(buf: &[u8]) -> Vec<LengthPrefix> {
         if buf.len() <= width {
             continue;
         }
-        let endians: &[(&str, bool)] =
-            if width == 1 { &[("be", true)] } else { &[("be", true), ("le", false)] };
+        let endians: &[(&str, bool)] = if width == 1 {
+            &[("be", true)]
+        } else {
+            &[("be", true), ("le", false)]
+        };
         for (endian, be) in endians {
             let value = read_uint(buf, width, *be);
             let declared = if value == buf.len() {
@@ -579,7 +674,12 @@ pub fn detect_length_prefixes(buf: &[u8]) -> Vec<LengthPrefix> {
             if value == 0 {
                 continue;
             }
-            out.push(LengthPrefix { width, endian, value, declared });
+            out.push(LengthPrefix {
+                width,
+                endian,
+                value,
+                declared,
+            });
         }
     }
     out
@@ -607,8 +707,7 @@ pub fn decode_auto(buf: &[u8]) -> Option<(Kind, Vec<RvNode>, Option<LengthPrefix
     if let Some(n) = try_decode_jce(buf) {
         return Some((Kind::Jce, n, None));
     }
-    try_decode_after_length_prefix(buf)
-        .map(|(k, n, p)| (k, n, Some(p)))
+    try_decode_after_length_prefix(buf).map(|(k, n, p)| (k, n, Some(p)))
 }
 
 // ─────────────────────────── 渲染 ───────────────────────────
@@ -653,7 +752,11 @@ pub fn head_hex_lines(b: &[u8], n: usize, per_line: usize) -> Vec<String> {
     let take = b.len().min(n);
     let mut out = Vec::new();
     for (li, chunk) in b[..take].chunks(per_line).enumerate() {
-        let hexs: String = chunk.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ");
+        let hexs: String = chunk
+            .iter()
+            .map(|x| format!("{x:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         out.push(format!("{:04x}  {hexs}", li * per_line));
     }
     if b.len() > take {
@@ -675,8 +778,14 @@ pub fn value_summary(v: &RvValue) -> String {
         RvValue::Float(f) => format!("{f}"),
         RvValue::Fixed { bytes, bits } => format!("fixed{bits}=0x{}", hex(bytes, 16)),
         RvValue::Str { text, .. } => format!("\"{}\"", text.replace('\n', "\\n")),
-        RvValue::Bytes { bytes, nested, nested_kind } => match (nested, nested_kind) {
-            (Some(n), Some(k)) => format!("bytes({}B) → {:?} 嵌套 {} 字段", bytes.len(), k, n.len()),
+        RvValue::Bytes {
+            bytes,
+            nested,
+            nested_kind,
+        } => match (nested, nested_kind) {
+            (Some(n), Some(k)) => {
+                format!("bytes({}B) → {:?} 嵌套 {} 字段", bytes.len(), k, n.len())
+            }
             _ => {
                 if let Some(t) = try_utf8(bytes) {
                     format!("\"{}\"", t.replace('\n', "\\n"))
@@ -718,10 +827,19 @@ fn render_nodes(nodes: &[RvNode], depth: usize, max: usize, out: &mut Vec<String
             RvValue::Map(entries) => {
                 out.push(format!("{indent}#{}: map {} 对", n.tag, entries.len()));
                 for (k, v) in entries {
-                    out.push(format!("{indent}  {} => #{} {}", value_summary(k), v.tag, value_summary(&v.value)));
+                    out.push(format!(
+                        "{indent}  {} => #{} {}",
+                        value_summary(k),
+                        v.tag,
+                        value_summary(&v.value)
+                    ));
                 }
             }
-            RvValue::Bytes { nested: Some(nested), nested_kind, bytes } => {
+            RvValue::Bytes {
+                nested: Some(nested),
+                nested_kind,
+                bytes,
+            } => {
                 out.push(format!(
                     "{indent}#{}: bytes({}B) → {:?}",
                     n.tag,
@@ -740,7 +858,10 @@ mod tests {
     use super::*;
 
     fn hex(s: &str) -> Vec<u8> {
-        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
 
     #[test]
@@ -777,7 +898,11 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         match &nodes[1].value {
-            RvValue::Int { raw: 5, bits: 32, signed: true } => {}
+            RvValue::Int {
+                raw: 5,
+                bits: 32,
+                signed: true,
+            } => {}
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -793,7 +918,10 @@ mod tests {
         let mut buf = vec![0, 0, 0, 8];
         buf.extend_from_slice(&hex("12026869")); // protobuf {2:"hi"}
         let p = detect_length_prefixes(&buf);
-        assert!(p.iter().any(|x| x.width == 4 && x.endian == "be" && x.declared == "total"));
+        assert!(
+            p.iter()
+                .any(|x| x.width == 4 && x.endian == "be" && x.declared == "total")
+        );
         let (kind, nodes, _) = decode_auto(&buf).unwrap();
         assert_eq!(kind, Kind::Protobuf);
         assert_eq!(nodes.len(), 1);

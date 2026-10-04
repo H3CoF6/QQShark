@@ -1,13 +1,13 @@
 //! 平台抽象：QQ 主进程枚举、权限检测、数据库占用（锁）探测。
 //!
-//! 移植自 `../x_key_scanner`，去掉其内存读取 trait（qqshark 的 `scan.rs` 已自行
-//! 用 process_vm_readv 实现），只保留与 pid↔UIN 映射相关的能力。
-
+//! 移植自 `../x_key_scanner`，去掉其内存读取 trait（qqshark 的 `scan.rs` 已自带
+//! 跨平台实现：Linux 用 process_vm_readv，Windows 用 ReadProcessMemory），
+//! 只保留与 pid→UIN 映射相关的能力。
 
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::{find_wrapper_node_pids, is_elevated};
+pub use windows::find_wrapper_node_pids;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -54,7 +54,7 @@ pub fn elevation_hint() -> &'static str {
     }
 }
 
-/// 探测权能并给出可读的诊断提示。返回是否提权。
+/// 探测权限并给出可读的诊断提示。返回是否提权。
 pub fn report_privileges() -> bool {
     let elevated = is_elevated();
     if elevated {
@@ -68,7 +68,7 @@ pub fn report_privileges() -> bool {
     elevated
 }
 
-/// 便捷：某个 pid 当前是否存活。
+/// 便携：某个 pid 当前是否存活。
 pub fn pid_alive(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -84,11 +84,13 @@ pub fn pid_alive(pid: u32) -> bool {
     }
 }
 
-/// 读取 `/proc/<pid>/comm`（Unix）。Windows 返回 None。
+/// 读取进程可执行名（Unix 为 `/proc/<pid>/comm`；Windows 为 exe 文件名）。
 pub fn comm_of(pid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
-        std::fs::read_to_string(format!("/proc/{pid}/comm")).ok().map(|s| s.trim().to_string())
+        std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .ok()
+            .map(|s| s.trim().to_string())
     }
     #[cfg(target_os = "macos")]
     {
@@ -96,7 +98,6 @@ pub fn comm_of(pid: u32) -> Option<String> {
     }
     #[cfg(windows)]
     {
-        let _ = pid;
-        None
+        windows::comm_of(pid)
     }
 }

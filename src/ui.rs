@@ -22,14 +22,21 @@ fn gradient(t: f32) -> Style {
     let t = t.clamp(0.0, 1.0);
     let r = (t * 255.0).round() as u8;
     let g = ((1.0 - t) * 255.0).round() as u8;
-    Style::new().fg_color(Some(Color::Rgb(RgbColor(r, g, 255)))).bold()
+    Style::new()
+        .fg_color(Some(Color::Rgb(RgbColor(r, g, 255))))
+        .bold()
 }
 
 /// Print the big startup banner: gradient figlet art + a subtitle line.
 pub fn app_banner(subtitle: &str) {
     let mut out = anstream::stdout();
     let _ = writeln!(out);
-    let width = BANNER_ART.iter().map(|l| l.chars().count()).max().unwrap_or(1).max(1) as f32;
+    let width = BANNER_ART
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(1)
+        .max(1) as f32;
     for line in BANNER_ART {
         let mut painted = String::new();
         for (col, ch) in line.chars().enumerate() {
@@ -50,7 +57,14 @@ pub fn section(title: &str) {
     let s = fg(AnsiColor::Cyan).bold();
     let mut out = anstream::stdout();
     let _ = writeln!(out, "\n{}", styled(s, title));
-    let _ = writeln!(out, "{}", styled(fg(AnsiColor::BrightBlack), &"─".repeat(title.chars().count().max(1))));
+    let _ = writeln!(
+        out,
+        "{}",
+        styled(
+            fg(AnsiColor::BrightBlack),
+            &"─".repeat(title.chars().count().max(1))
+        )
+    );
 }
 
 /// A "label: value" line with a dim label and a bright value.
@@ -63,17 +77,29 @@ pub fn field(label: &str, value: &str) {
 
 pub fn ok(msg: &str) {
     let mut out = anstream::stdout();
-    let _ = writeln!(out, "{}  {msg}", styled(fg(AnsiColor::Green).bold(), "[ ok ]"));
+    let _ = writeln!(
+        out,
+        "{}  {msg}",
+        styled(fg(AnsiColor::Green).bold(), "[ ok ]")
+    );
 }
 
 pub fn info(msg: &str) {
     let mut out = anstream::stdout();
-    let _ = writeln!(out, "{} {msg}", styled(fg(AnsiColor::Blue).bold(), "[info]"));
+    let _ = writeln!(
+        out,
+        "{} {msg}",
+        styled(fg(AnsiColor::Blue).bold(), "[info]")
+    );
 }
 
 pub fn warn(msg: &str) {
     let mut out = anstream::stderr();
-    let _ = writeln!(out, "{} {msg}", styled(fg(AnsiColor::Yellow).bold(), "[warn]"));
+    let _ = writeln!(
+        out,
+        "{} {msg}",
+        styled(fg(AnsiColor::Yellow).bold(), "[warn]")
+    );
 }
 
 pub fn error(msg: &str) {
@@ -155,12 +181,7 @@ fn pad_to(s: &str, cols: usize) -> String {
 }
 
 /// 纯文本方框（不含 ANSI，便于单测断言）。顶部 header 段用 ` · ` 连接。
-pub fn render_box(
-    dir: Dir,
-    segments: &[String],
-    body: &[String],
-    min_width: usize,
-) -> String {
+pub fn render_box(dir: Dir, segments: &[String], body: &[String], min_width: usize) -> String {
     let head = format!("{} {} {}", dir.arrow(), dir.label(), segments.join(" · "));
     let head_w = display_width(&head);
     // 内容区宽度：必须 ≥ 最长正文行（否则 pad_to 填不下会溢出、右边框右移），
@@ -202,7 +223,12 @@ pub fn packet_box(dir: Dir, segments: &[String], body: &[String], min_width: usi
             let bytes: Vec<char> = line.chars().collect();
             if bytes.len() >= 2 {
                 let mid: String = bytes[1..bytes.len() - 1].iter().collect();
-                format!("{}{}{}", styled(border, &bytes[0].to_string()), mid, styled(border, &bytes[bytes.len() - 1].to_string()))
+                format!(
+                    "{}{}{}",
+                    styled(border, &bytes[0].to_string()),
+                    mid,
+                    styled(border, &bytes[bytes.len() - 1].to_string())
+                )
             } else {
                 line.to_string()
             }
@@ -227,7 +253,11 @@ mod tests {
         assert_eq!(lines.len(), 4); // 上框 + 2 行 + 下框
         assert!(lines[0].starts_with('┌') && lines[0].ends_with('┐'));
         assert!(lines[3].starts_with('└') && lines[3].ends_with('┘'));
-        assert!(lines[0].contains("TX") && lines[0].contains("seq=1") && lines[0].contains("cmd=Foo.Bar"));
+        assert!(
+            lines[0].contains("TX")
+                && lines[0].contains("seq=1")
+                && lines[0].contains("cmd=Foo.Bar")
+        );
         // 所有行显示宽度一致
         let w = display_width(lines[0]);
         for l in &lines {
@@ -240,7 +270,12 @@ mod tests {
         // 回归：最长正文行恰好等于内容区宽度时，右边框不得右移。
         let long = "0000  ".to_string() + &"aa ".repeat(32);
         let long = long.trim_end().to_string();
-        let b = render_box(Dir::Tx, &["seq=1".into()], &[long.clone(), "short".into()], 0);
+        let b = render_box(
+            Dir::Tx,
+            &["seq=1".into()],
+            &[long.clone(), "short".into()],
+            0,
+        );
         let lines: Vec<&str> = b.lines().collect();
         let w = display_width(lines[0]);
         for l in &lines {
@@ -260,7 +295,13 @@ mod tests {
 
     #[test]
     fn gradient_stays_in_range() {
-        assert_eq!(gradient(-1.0).get_fg_color(), Some(Color::Rgb(RgbColor(0, 255, 255))));
-        assert_eq!(gradient(2.0).get_fg_color(), Some(Color::Rgb(RgbColor(255, 0, 255))));
+        assert_eq!(
+            gradient(-1.0).get_fg_color(),
+            Some(Color::Rgb(RgbColor(0, 255, 255)))
+        );
+        assert_eq!(
+            gradient(2.0).get_fg_color(),
+            Some(Color::Rgb(RgbColor(255, 0, 255)))
+        );
     }
 }

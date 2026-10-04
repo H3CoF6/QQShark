@@ -37,7 +37,10 @@ pub fn decrypt_db_bytes(
     algo: &Algo,
 ) -> io::Result<Decrypted> {
     let plain = decrypt_database(db_bytes, passphrase, algo).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "数据库解密失败（算法或密钥不匹配）")
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "数据库解密失败（算法或密钥不匹配）",
+        )
     })?;
 
     let skip = |warning: Option<String>| Decrypted {
@@ -61,7 +64,11 @@ pub fn decrypt_db_bytes(
     let frames = (plain_wal.len() - WAL_HDR_SIZE) / (WAL_FRAME_HDR_SIZE + PAGE_SIZE);
 
     match replay(&plain, &plain_wal) {
-        Ok(bytes) => Ok(Decrypted { bytes, wal_frames: frames, wal_warning: None }),
+        Ok(bytes) => Ok(Decrypted {
+            bytes,
+            wal_frames: frames,
+            wal_warning: None,
+        }),
         Err(e) => Ok(skip(Some(format!("WAL 回放失败：{e}")))),
     }
 }
@@ -91,10 +98,12 @@ fn replay_in(dir: &Path, db_plain: &[u8], wal_plain: &[u8]) -> io::Result<Vec<u8
     {
         let conn = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_WRITE)
             .map_err(sqlite_err)?;
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").map_err(sqlite_err)?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(sqlite_err)?;
 
-        let pages: i64 =
-            conn.query_row("PRAGMA page_count", [], |row| row.get(0)).map_err(sqlite_err)?;
+        let pages: i64 = conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .map_err(sqlite_err)?;
         if committed_pages != 0 && pages < i64::from(committed_pages) {
             return Err(io::Error::other(format!(
                 "SQLite 只得到 {pages} 页，WAL 最后一个提交却声明 {committed_pages} 页",
@@ -105,7 +114,9 @@ fn replay_in(dir: &Path, db_plain: &[u8], wal_plain: &[u8]) -> io::Result<Vec<u8
             .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
             .map_err(sqlite_err)?;
         if !mode.eq_ignore_ascii_case("delete") {
-            return Err(io::Error::other(format!("SQLite 未能退出 WAL 模式（当前为 {mode}）")));
+            return Err(io::Error::other(format!(
+                "SQLite 未能退出 WAL 模式（当前为 {mode}）"
+            )));
         }
     }
 

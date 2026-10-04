@@ -9,8 +9,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::login_db::{self, Account};
 use crate::locate;
+use crate::login_db::{self, Account};
 use crate::platform::{self, DbHolder};
 use crate::ui;
 
@@ -19,7 +19,7 @@ use crate::ui;
 pub struct ProcInfo {
     pub pid: u32,
     pub comm: String,
-   /// 加载了 wrapper.node（真正的 QQ 主进程）。
+    /// 加载了 wrapper.node（真正的 QQ 主进程）。
     pub is_main: bool,
     pub uin: Option<String>,
     pub uid: Option<String>,
@@ -87,7 +87,9 @@ pub fn scan_all(root: Option<PathBuf>) -> ScanAll {
                 .find(|h| wrapper_pids.contains(&h.pid))
                 .or_else(|| holders.first());
             if let Some(h) = chosen {
-                by_pid.entry(h.pid).or_insert_with(|| (acc.clone(), h.name.clone(), true));
+                by_pid
+                    .entry(h.pid)
+                    .or_insert_with(|| (acc.clone(), h.name.clone(), true));
             }
         }
     }
@@ -126,7 +128,12 @@ pub fn scan_all(root: Option<PathBuf>) -> ScanAll {
     }
     procs.sort_by_key(|p| (!p.logged_in, p.pid));
 
-    ScanAll { root, procs, accounts_loaded, accounts }
+    ScanAll {
+        root,
+        procs,
+        accounts_loaded,
+        accounts,
+    }
 }
 
 /// 解析用户选择的 pid：`None` 时若只有一个已登录进程则自动选它，否则报错。
@@ -151,19 +158,29 @@ pub fn resolve_pid(procs: &[ProcInfo], wanted: Option<u32>) -> anyhow::Result<u3
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn mk(pid: u32, main: bool, logged: bool) -> ProcInfo {
-        ProcInfo { pid, comm: "qq".into(), is_main: main, uin: None, uid: None, nick: None, logged_in: logged }
+        ProcInfo {
+            pid,
+            comm: "qq".into(),
+            is_main: main,
+            uin: None,
+            uid: None,
+            nick: None,
+            logged_in: logged,
+        }
     }
 
     #[test]
     fn resolve_prefers_explicit_pid() {
         let procs = vec![mk(1, true, true)];
-        assert_eq!(resolve_pid(&procs, Some(std::process::id())).unwrap(), std::process::id());
+        assert_eq!(
+            resolve_pid(&procs, Some(std::process::id())).unwrap(),
+            std::process::id()
+        );
     }
 
     #[test]

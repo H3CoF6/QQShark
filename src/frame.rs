@@ -75,7 +75,10 @@ pub fn parse_frame(b: &[u8]) -> Option<MsfFrame<'_>> {
     if cipher.is_empty() || !cipher.len().is_multiple_of(8) {
         return None;
     }
-    Some(MsfFrame { encrypt_type, cipher })
+    Some(MsfFrame {
+        encrypt_type,
+        cipher,
+    })
 }
 
 /// 解密 SsoPacker 明文里的命令名。
@@ -139,7 +142,10 @@ pub fn decode_plain(plain: &[u8]) -> Option<Decoded> {
     } else {
         Vec::new()
     };
-    Some(Decoded { cmd: parse_cmd(plain), body })
+    Some(Decoded {
+        cmd: parse_cmd(plain),
+        body,
+    })
 }
 
 /// 从重组流里切出完整帧，返回 (帧列表, 剩余残留)。
@@ -149,7 +155,8 @@ pub fn extract_frames(buf: &mut Vec<u8>) -> Vec<Vec<u8>> {
     while i + 8 <= buf.len() {
         let total = be32(&buf[i..i + 4]) as usize;
         let proto = be32(&buf[i + 4..i + 8]);
-        if total >= 8 && (proto == PROTO_D2AUTH || proto == PROTO_SIMPLE) && i + total <= buf.len() {
+        if total >= 8 && (proto == PROTO_D2AUTH || proto == PROTO_SIMPLE) && i + total <= buf.len()
+        {
             frames.push(buf[i..i + total].to_vec());
             i += total;
         } else {
@@ -239,7 +246,9 @@ mod tests {
     /// 真实抓包帧：TEA 解密 → SsoPacker 切出 cmd 与正文 → 正文按 protobuf 展开。
     #[test]
     fn decode_real_frame_yields_cmd_and_protobuf_body() {
-        let key: [u8; 16] = unhex("44773377403d28545d752a734e42432e").try_into().unwrap();
+        let key: [u8; 16] = unhex("44773377403d28545d752a734e42432e")
+            .try_into()
+            .unwrap();
         let cipher = unhex(CIPHER_HEX);
         let d = decode(&cipher, &key).expect("decode");
         assert_eq!(d.cmd.as_deref(), Some("OidbSvcTrpcTcp.0x10c0_1"));
@@ -247,6 +256,9 @@ mod tests {
         let (kind, nodes, prefix) = crate::codec::decode_auto(&d.body).expect("body should decode");
         assert_eq!(kind, crate::codec::Kind::Protobuf);
         assert!(prefix.is_none(), "正文本身已是 protobuf，不应剥前缀");
-        assert!(matches!(nodes[0].value, crate::codec::RvValue::Int { raw: 0x10c0, .. }));
+        assert!(matches!(
+            nodes[0].value,
+            crate::codec::RvValue::Int { raw: 0x10c0, .. }
+        ));
     }
 }

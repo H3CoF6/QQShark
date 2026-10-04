@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 pub fn login_db_path(root: &Path) -> PathBuf {
     #[cfg(windows)]
     {
-        root.join("nt_qq").join("global").join("nt_db").join("login.db")
+        root.join("nt_qq")
+            .join("global")
+            .join("nt_db")
+            .join("login.db")
     }
     #[cfg(not(windows))]
     {
@@ -19,8 +22,16 @@ pub fn login_db_candidates(root: &Path) -> Vec<PathBuf> {
     let primary = login_db_path(root);
     #[cfg(target_os = "linux")]
     {
-        let alt = root.join("nt_qq").join("global").join("nt_db").join("login.db");
-        if alt == primary { vec![primary] } else { vec![primary, alt] }
+        let alt = root
+            .join("nt_qq")
+            .join("global")
+            .join("nt_db")
+            .join("login.db");
+        if alt == primary {
+            vec![primary]
+        } else {
+            vec![primary, alt]
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -40,7 +51,8 @@ pub fn account_db_dir(root: &Path, uin: &str, uid: &str) -> PathBuf {
     #[cfg(not(windows))]
     {
         let _ = uin;
-        root.join(format!("nt_qq_{}", account_hash(uid))).join("nt_db")
+        root.join(format!("nt_qq_{}", account_hash(uid)))
+            .join("nt_db")
     }
 }
 
@@ -65,12 +77,24 @@ pub fn detect_data_root() -> Option<PathBuf> {
     }
     #[cfg(target_os = "macos")]
     {
-        Some(home_dir()?.join("Library/Containers/com.tencent.qq/Data/Library/Application Support/QQ"))
+        Some(
+            home_dir()?
+                .join("Library/Containers/com.tencent.qq/Data/Library/Application Support/QQ"),
+        )
     }
 }
 
 #[cfg(windows)]
 fn detect_windows_root() -> Option<PathBuf> {
+    if let Some(p) = detect_windows_root_from_ini() {
+        return Some(p);
+    }
+    detect_windows_root_from_documents()
+}
+
+/// 从 `UserDataInfo.ini` 读取自定义数据目录（可能不在 Documents 下）。
+#[cfg(windows)]
+fn detect_windows_root_from_ini() -> Option<PathBuf> {
     const INI: &str = r"C:\Users\Public\Documents\Tencent\QQ\UserDataInfo.ini";
     let text = std::fs::read_to_string(INI).ok()?;
     let mut in_section = false;
@@ -85,23 +109,44 @@ fn detect_windows_root() -> Option<PathBuf> {
                 .split_once('=')
                 .filter(|(k, _)| k.trim().eq_ignore_ascii_case("UserDataSavePath"))
                 .map(|(_, v)| v.trim());
-            if let Some(val) = stripped {
-                if !val.is_empty() {
-                    let p = PathBuf::from(val);
-                    if p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("Tencent Files")) {
-                        return Some(p);
-                    }
-                    return Some(p.join("Tencent Files"));
+            if let Some(val) = stripped
+                && !val.is_empty()
+            {
+                let p = PathBuf::from(val);
+                if p.file_name()
+                    .is_some_and(|n| n.eq_ignore_ascii_case("Tencent Files"))
+                {
+                    return Some(p);
                 }
+                return Some(p.join("Tencent Files"));
             }
         }
     }
     None
 }
 
+/// 回退：默认 `%USERPROFILE%\Documents\Tencent Files`，并优先返回含 `login.db` 的那个。
+#[cfg(windows)]
+fn detect_windows_root_from_documents() -> Option<PathBuf> {
+    let home = std::env::var_os("USERPROFILE").map(PathBuf::from)?;
+    let docs = home.join("Documents").join("Tencent Files");
+    if docs
+        .join("nt_qq")
+        .join("global")
+        .join("nt_db")
+        .join("login.db")
+        .exists()
+    {
+        return Some(docs);
+    }
+    docs.exists().then_some(docs)
+}
+
 #[cfg(unix)]
 pub(crate) fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
 }
 
 /// 解析 `~/.config/QQ`，并容忍 `sudo`（此时 HOME=/root 无 login.db，回退到

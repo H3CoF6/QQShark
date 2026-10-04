@@ -39,15 +39,32 @@ fn request_stop() {
     STOP.store(true, Ordering::Relaxed);
 }
 
-extern "C" fn on_sigint(_sig: libc::c_int) {
-    request_stop();
-}
-
-/// 安装 SIGINT 处理器（Ctrl+C 优雅收尾而非直接杀进程）。
+/// 安装 Ctrl+C 处理器（优雅收尾而非直接杀进程）。
 pub fn install_interrupt_handler() {
-    // SAFETY: standard signal registration with a plain C handler.
-    unsafe {
-        libc::signal(libc::SIGINT, on_sigint as *const () as usize as libc::sighandler_t);
+    #[cfg(unix)]
+    {
+        extern "C" fn on_sigint(_sig: libc::c_int) {
+            request_stop();
+        }
+        // SAFETY: standard signal registration with a plain C handler.
+        unsafe {
+            libc::signal(
+                libc::SIGINT,
+                on_sigint as *const () as usize as libc::sighandler_t,
+            );
+        }
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+        extern "system" fn on_ctrl(_kind: u32) -> i32 {
+            request_stop();
+            1
+        }
+        // SAFETY: registers a process-wide ctrl handler; the callback only sets an atomic flag.
+        unsafe {
+            SetConsoleCtrlHandler(Some(on_ctrl), 1);
+        }
     }
 }
 
@@ -93,16 +110,58 @@ impl Drop for RawGuard {
     }
 }
 
+/// Windows 控制台 raw 模式守卫：关闭行缓冲/回显，Drop 时恢复。
 #[cfg(not(unix))]
-struct RawGuard;
+struct RawGuard {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    saved: Option<u32>,
+}
+
 #[cfg(not(unix))]
 impl RawGuard {
     fn new() -> Self {
-        Self
+        use windows_sys::Win32::System::Console::{
+            ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE,
+            SetConsoleMode,
+        };
+        // SAFETY: queries and updates the console input mode.
+        unsafe {
+            let handle = GetStdHandle(STD_INPUT_HANDLE);
+            let mut mode = 0u32;
+            if GetConsoleMode(handle, &mut mode) == 0 {
+                return Self {
+                    handle,
+                    saved: None,
+                };
+            }
+            let new_mode = mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
+            if SetConsoleMode(handle, new_mode) == 0 {
+                return Self {
+                    handle,
+                    saved: None,
+                };
+            }
+            Self {
+                handle,
+                saved: Some(mode),
+            }
+        }
     }
 }
 
-/// 监听 ESC / q 按键的线程（仅在 TTY 生效）。
+#[cfg(not(unix))]
+impl Drop for RawGuard {
+    fn drop(&mut self) {
+        if let Some(mode) = self.saved {
+            // SAFETY: restores the console mode captured in new().
+            unsafe {
+                windows_sys::Win32::System::Console::SetConsoleMode(self.handle, mode);
+            }
+        }
+    }
+}
+
+/// 监听 ESC / q 按键的线程（仅在 TTY/控制台生效）。
 fn spawn_key_watcher() {
     #[cfg(unix)]
     {
@@ -118,6 +177,46 @@ fn spawn_key_watcher() {
                 // SAFETY: single-byte read from stdin.
                 let n = unsafe { libc::read(0, b.as_mut_ptr() as *mut libc::c_void, 1) };
                 if n <= 0 {
+                    return;
+                }
+                if b[0] == 0x1b || b[0] == b'q' || b[0] == b'Q' {
+                    request_stop();
+                    return;
+                }
+            }
+        });
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{
+            GetConsoleMode, GetStdHandle, ReadConsoleA, STD_INPUT_HANDLE,
+        };
+        // SAFETY: probe stdin console mode; skip if not a console (e.g. redirected).
+        let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        let mut mode = 0u32;
+        if handle.is_null() || unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
+            return;
+        }
+        let handle = handle as usize;
+        std::thread::spawn(move || {
+            let handle = handle as windows_sys::Win32::Foundation::HANDLE;
+            loop {
+                if stop_requested() {
+                    return;
+                }
+                let mut b = [0u8; 1];
+                let mut read = 0u32;
+                // SAFETY: single-byte console read into a 1-byte buffer.
+                let ok = unsafe {
+                    ReadConsoleA(
+                        handle,
+                        b.as_mut_ptr() as *mut _,
+                        1,
+                        &mut read,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 || read == 0 {
                     return;
                 }
                 if b[0] == 0x1b || b[0] == b'q' || b[0] == b'Q' {
@@ -260,7 +359,12 @@ fn parse_tcp(data: &[u8]) -> Option<TcpInfo> {
     if off > data.len() {
         return None;
     }
-    Some(TcpInfo { sport, dport, seq, payload_off: off })
+    Some(TcpInfo {
+        sport,
+        dport,
+        seq,
+        payload_off: off,
+    })
 }
 
 /// 简易经典 pcap 写文件。
@@ -298,8 +402,11 @@ impl PcapWriter {
 fn hexdump(b: &[u8]) -> Vec<String> {
     let mut lines = Vec::new();
     for (i, chunk) in b.chunks(32).enumerate() {
-        let hexs: String =
-            chunk.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ");
+        let hexs: String = chunk
+            .iter()
+            .map(|x| format!("{x:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         lines.push(format!("{:04x}  {hexs}", i * 32));
     }
     lines
@@ -307,37 +414,74 @@ fn hexdump(b: &[u8]) -> Vec<String> {
 
 /// 权限相关错误的中文提示。
 fn open_error_hint(iface: &str, e: &str) -> String {
-    format!(
-        "无法在接口 '{iface}' 上开启抓包：{e}\n\
-         → 抓包需要 root 或 CAP_NET_RAW。请：\n\
-         1) 直接提权重跑： `sudo ./qqshark capture -i {iface}`\n\
-         2) 或给二进制放开规则（免 sudo）：\n\
-            `sudo setcap cap_net_raw,cap_net_admin+eip $(readlink -f ./qqshark)`\n\
-         3) 若使用 Clash/Meta TUN：QQ 流量会出现在 `Meta` 接口上，用 `-i Meta`；\n\
-            否则用物理网卡（`-i any` / `-i wlan0` / `-i eth0`）即可，无需 TUN。"
-    )
+    #[cfg(unix)]
+    {
+        format!(
+            "无法在接口 '{iface}' 上开启抓包：{e}\n\
+             → 抓包需要 root 或 CAP_NET_RAW。请：\n\
+             1) 直接提权重跑： `sudo ./qqshark capture -i {iface}`\n\
+             2) 或给二进制放开规则（免 sudo）：\n\
+                `sudo setcap cap_net_raw,cap_net_admin+eip $(readlink -f ./qqshark)`\n\
+             3) 若使用 Clash/Meta TUN：QQ 流量会出现在 `Meta` 接口上，用 `-i Meta`；\n\
+                否则用物理网卡（`-i any` / `-i wlan0` / `-i eth0`）即可，无需 TUN。"
+        )
+    }
+    #[cfg(windows)]
+    {
+        format!(
+            "无法在接口 '{iface}' 上开启抓包：{e}\n\
+             → Windows 抓包依赖 Npcap 驱动 + 管理员权限。请：\n\
+             1) 以管理员身份重跑：在“管理员 PowerShell / 终端”里执行\n\
+                `qqshark capture -i \"{iface}\"`（等价于 Linux 的 sudo）；\n\
+             2) 安装/修复 Npcap（https://npcap.com/dist/）：安装时勾选\n\
+                “Install Npcap in WinPcap API-compatible Mode”，确保\n\
+                `wpcap.dll`、`Packet.dll` 位于 `C:\\Windows\\System32\\Npcap\\`\n\
+                （或与本工具 exe 同目录）；\n\
+             3) 接口名要填 Npcap 设备名（形如 `\\Device\\NPF_{{GUID}}` 或网卡描述）：\n\
+                直接运行 `qqshark capture` 会列出全部可用设备；\n\
+             4) 若只列出“回环适配器”：重装 Npcap 并勾选安装到所有网卡\n\
+                （含 “Support loopback traffic capture”），或改选物理网卡；\n\
+             5) 若走代理/TUN（Clash 等），选对应虚拟网卡，或直接抓物理卡的\n\
+                TCP 14000 流量即可（无需 TUN）。"
+        )
+    }
 }
 
 /// 检查是否具备抓包权限，给出可读诊断。
 pub fn check_capture_privileges(iface: &str) -> bool {
-    let root = crate::platform::is_elevated();
-    let has_cap = std::fs::read_to_string("/proc/self/status")
-        .map(|s| {
-            s.lines().any(|l| {
-                l.starts_with("CapEff:") && {
-                    // 位 13 = CAP_NET_RAW, 位 12 = CAP_NET_ADMIN
-                    let hex = l.split_whitespace().nth(1).unwrap_or("0");
-                    u64::from_str_radix(hex, 16).map(|v| v & (1 << 13) != 0).unwrap_or(false)
-                }
+    let elevated = crate::platform::is_elevated();
+    #[cfg(unix)]
+    {
+        let has_cap = std::fs::read_to_string("/proc/self/status")
+            .map(|s| {
+                s.lines().any(|l| {
+                    l.starts_with("CapEff:") && {
+                        // 位 13 = CAP_NET_RAW, 位 12 = CAP_NET_ADMIN
+                        let hex = l.split_whitespace().nth(1).unwrap_or("0");
+                        u64::from_str_radix(hex, 16)
+                            .map(|v| v & (1 << 13) != 0)
+                            .unwrap_or(false)
+                    }
+                })
             })
-        })
-        .unwrap_or(false);
-    if root || has_cap {
-        true
-    } else {
-        ui::warn(&format!(
+            .unwrap_or(false);
+        if elevated || has_cap {
+            return true;
+        }
+        crate::ui::warn(&format!(
             "当前没有 root/CAP_NET_RAW 权限，抓包可能失败。接口 '{iface}' 需要提权或放开规则；\
              若失败请按提示执行 setcap 或 sudo。"
+        ));
+        false
+    }
+    #[cfg(windows)]
+    {
+        if elevated {
+            return true;
+        }
+        crate::ui::warn(&format!(
+            "当前没有管理员权限，接口 '{iface}' 的抓包大概率失败（等价于 Linux 的 root/CAP_NET_RAW）。\
+             请在“管理员终端”重跑；若从未装过 Npcap，请先安装并勾选 WinPcap API 兼容模式。"
         ));
         false
     }
@@ -361,10 +505,22 @@ struct FrameView<'a> {
 }
 
 fn emit_frame(opts: &CaptureOpts, v: &FrameView<'_>) {
-    let FrameView { direction, proto, et, seq, raw: f, plain, decoded } = *v;
-    let cmd_s = decoded
-        .and_then(|d| d.cmd.clone())
-        .unwrap_or_else(|| if direction == Dir::Rx { "(响应)".to_string() } else { "-".to_string() });
+    let FrameView {
+        direction,
+        proto,
+        et,
+        seq,
+        raw: f,
+        plain,
+        decoded,
+    } = *v;
+    let cmd_s = decoded.and_then(|d| d.cmd.clone()).unwrap_or_else(|| {
+        if direction == Dir::Rx {
+            "(响应)".to_string()
+        } else {
+            "-".to_string()
+        }
+    });
     let bodylen = decoded.map(|d| d.body.len()).unwrap_or(0);
     let mut segments = vec![
         format!("seq={seq}"),
@@ -382,11 +538,22 @@ fn emit_frame(opts: &CaptureOpts, v: &FrameView<'_>) {
     let mut body: Vec<String> = Vec::new();
     // 默认：前 128 字节 hex，按每行 32 字节换行（有明文看明文，否则看原始帧）。
     let content = plain.unwrap_or(f);
-    body.push(format!("{}[0..128]:", if plain.is_some() { "plain" } else { "raw" }));
+    body.push(format!(
+        "{}[0..128]:",
+        if plain.is_some() { "plain" } else { "raw" }
+    ));
     body.extend(codec::head_hex_lines(content, 128, 32));
 
     if opts.hex {
-        body.push(format!("{} {} 字节：", if plain.is_some() { "明文" } else { "原始帧" }, content.len()));
+        body.push(format!(
+            "{} {} 字节：",
+            if plain.is_some() {
+                "明文"
+            } else {
+                "原始帧"
+            },
+            content.len()
+        ));
         body.extend(hexdump(content));
     }
 
@@ -411,7 +578,9 @@ fn emit_frame(opts: &CaptureOpts, v: &FrameView<'_>) {
             Some(_) => body.push("(正文为空)".to_string()),
             None => {
                 if et != 1 {
-                    body.push(format!("(et={et} 未加密帧，无 TEA 密文；正文见上方 raw hex)"));
+                    body.push(format!(
+                        "(et={et} 未加密帧，无 TEA 密文；正文见上方 raw hex)"
+                    ));
                 } else if plain.is_none() {
                     body.push("(et=1 但未提供 d2key，无法解密展开)".to_string());
                 } else {
@@ -428,7 +597,29 @@ pub fn run(opts: CaptureOpts) -> anyhow::Result<()> {
     let _guard = RawGuard::new();
     spawn_key_watcher();
 
-    let device = pcap::Device::from(opts.iface.as_str());
+    // 若接口名无效（Windows 上常见：需要 Npcap 设备名），列出可用设备帮助定位。
+    let device = match pcap::Device::list().map(|list| {
+        list.into_iter().find(|d| {
+            d.name == opts.iface
+                || d.desc.as_deref() == Some(opts.iface.as_str())
+                || d.name.eq_ignore_ascii_case(&opts.iface)
+        })
+    }) {
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            ui::warn(&format!("未找到接口 '{}'，可用设备如下：", opts.iface));
+            match pcap::Device::list() {
+                Ok(list) => {
+                    for d in &list {
+                        ui::field(&d.name, d.desc.as_deref().unwrap_or(""));
+                    }
+                }
+                Err(e) => ui::warn(&format!("枚举设备失败：{e}")),
+            }
+            anyhow::bail!("请用上表中的设备名作为 -i/--iface 重试");
+        }
+        Err(_) => pcap::Device::from(opts.iface.as_str()),
+    };
     let mut cap = pcap::Capture::from_device(device)
         .context("open device")?
         .immediate_mode(true)
@@ -439,7 +630,8 @@ pub fn run(opts: CaptureOpts) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!(open_error_hint(&opts.iface, &e.to_string())))?;
 
     let filter = format!("tcp port {}", opts.port);
-    cap.filter(&filter, true).with_context(|| format!("set filter '{filter}'"))?;
+    cap.filter(&filter, true)
+        .with_context(|| format!("set filter '{filter}'"))?;
     let linktype = cap.get_datalink();
     let lt = linktype.0;
     let l2 = l2_offset(lt);
@@ -449,7 +641,10 @@ pub fn run(opts: CaptureOpts) -> anyhow::Result<()> {
     ui::field("链路层", &format!("linktype={lt} (l2={l2})"));
     ui::field(
         "d2key",
-        &opts.d2key.map(hex::encode).unwrap_or_else(|| "（未提供，帧内容不解密）".to_string()),
+        &opts
+            .d2key
+            .map(hex::encode)
+            .unwrap_or_else(|| "（未提供，帧内容不解密）".to_string()),
     );
     ui::info("按 Ctrl+C 或 ESC 结束抓包。");
 
@@ -490,7 +685,9 @@ pub fn run(opts: CaptureOpts) -> anyhow::Result<()> {
             continue;
         }
         let ip = &data[l2..];
-        let Some((src, dst, proto, l4)) = parse_ip(ip) else { continue };
+        let Some((src, dst, proto, l4)) = parse_ip(ip) else {
+            continue;
+        };
         if proto != 6 {
             continue;
         }
@@ -498,9 +695,21 @@ pub fn run(opts: CaptureOpts) -> anyhow::Result<()> {
         let payload = &l4[tcp.payload_off..];
 
         let (key, is_c2s) = if tcp.dport == opts.port {
-            (FlowKey { client: (src, tcp.sport), server: (dst, tcp.dport) }, true)
+            (
+                FlowKey {
+                    client: (src, tcp.sport),
+                    server: (dst, tcp.dport),
+                },
+                true,
+            )
         } else if tcp.sport == opts.port {
-            (FlowKey { client: (dst, tcp.dport), server: (src, tcp.sport) }, false)
+            (
+                FlowKey {
+                    client: (dst, tcp.dport),
+                    server: (src, tcp.sport),
+                },
+                false,
+            )
         } else {
             continue;
         };
@@ -514,10 +723,15 @@ pub fn run(opts: CaptureOpts) -> anyhow::Result<()> {
             let direction = dir_of(is_c2s);
             let parsed = frame::parse_frame(&f);
             let proto_v = u32::from_be_bytes([f[4], f[5], f[6], f[7]]);
-            let seq = f.get(8..12).map(|b| u32::from_be_bytes(b.try_into().unwrap())).unwrap_or(0);
+            let seq = f
+                .get(8..12)
+                .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
+                .unwrap_or(0);
             let et = f.get(8).copied().unwrap_or(0);
             let plain: Option<Vec<u8>> = match (&parsed, opts.d2key) {
-                (Some(mf), Some(key)) if mf.encrypt_type == 1 => Some(tea::decrypt(mf.cipher, &key)),
+                (Some(mf), Some(key)) if mf.encrypt_type == 1 => {
+                    Some(tea::decrypt(mf.cipher, &key))
+                }
                 _ => None,
             };
             let decoded = plain.as_deref().and_then(frame::decode_plain);
@@ -560,7 +774,9 @@ mod tests {
 
     #[test]
     fn parse_ipv4_header() {
-        let mut p = vec![0x45, 0, 0, 20, 0, 0, 0, 0, 64, 6, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
+        let mut p = vec![
+            0x45, 0, 0, 20, 0, 0, 0, 0, 64, 6, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8,
+        ];
         p.extend_from_slice(&[0xde, 0xad]);
         let (src, dst, proto, l4) = parse_ip(&p).unwrap();
         assert_eq!(src, "1.2.3.4".parse::<IpAddr>().unwrap());

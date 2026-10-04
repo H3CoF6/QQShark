@@ -92,6 +92,30 @@ pub fn is_elevated() -> bool {
 }
 
 /// 某个 pid 是否存活。
+/// 读取进程名（exe 文件名，如 `QQ.exe`）。找不到返回 None。
+pub fn comm_of(pid: u32) -> Option<String> {
+    // SAFETY: standard process snapshot walk; handle closed before return.
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut pe: PROCESSENTRY32W = std::mem::zeroed();
+        pe.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        let mut name = None;
+        let mut ok = Process32FirstW(snap, &mut pe);
+        while ok != 0 {
+            if pe.th32ProcessID == pid {
+                name = Some(wide_to_string(&pe.szExeFile));
+                break;
+            }
+            ok = Process32NextW(snap, &mut pe);
+        }
+        CloseHandle(snap);
+        name
+    }
+}
+
 pub fn pid_alive(pid: u32) -> bool {
     // SAFETY: OpenProcess query, handle closed immediately.
     unsafe {

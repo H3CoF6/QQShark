@@ -11,7 +11,9 @@ pub fn find_wrapper_node_pids() -> io::Result<Vec<u32>> {
         let Ok(entry) = entry else { continue };
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Ok(pid) = name.parse::<u32>() else { continue };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
         if maps_has_wrapper(pid) {
             pids.push(pid);
         }

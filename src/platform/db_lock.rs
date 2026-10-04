@@ -35,8 +35,8 @@ mod windows {
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
     use windows_sys::Win32::Foundation::{
-        ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SESSION_CREDENTIAL_CONFLICT,
-        ERROR_SUCCESS,
+        ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA,
+        ERROR_SESSION_CREDENTIAL_CONFLICT, ERROR_SUCCESS,
     };
     use windows_sys::Win32::System::RestartManager::{
         CCH_RM_SESSION_KEY, RM_PROCESS_INFO, RmEndSession, RmGetList, RmRegisterResources,
@@ -67,8 +67,11 @@ mod windows {
             return Ok(Vec::new());
         }
 
-        let wide: Vec<u16> =
-            db_path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let wide: Vec<u16> = db_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
         let mut session_key = [0u16; (CCH_RM_SESSION_KEY + 1) as usize];
         let mut session_handle: u32 = 0;
 
@@ -104,7 +107,10 @@ mod windows {
             )
         };
         if reg_err != ERROR_SUCCESS {
-            return Err(io::Error::other(describe_err("RmRegisterResources", reg_err)));
+            return Err(io::Error::other(describe_err(
+                "RmRegisterResources",
+                reg_err,
+            )));
         }
 
         let mut needed: u32 = 0;
@@ -112,7 +118,13 @@ mod windows {
         let mut reboot_reasons: u32 = 0;
         // SAFETY: null buffer + in/out counts + reboot-reason out param.
         let list_err = unsafe {
-            RmGetList(session_handle, &mut needed, &mut count, std::ptr::null_mut(), &mut reboot_reasons)
+            RmGetList(
+                session_handle,
+                &mut needed,
+                &mut count,
+                std::ptr::null_mut(),
+                &mut reboot_reasons,
+            )
         };
         if list_err != ERROR_SUCCESS && list_err != ERROR_MORE_DATA {
             return Err(io::Error::other(describe_err("RmGetList(first)", list_err)));
@@ -126,7 +138,13 @@ mod windows {
             let mut infos = vec![unsafe { std::mem::zeroed::<RM_PROCESS_INFO>() }; needed as usize];
             count = needed;
             let err = unsafe {
-                RmGetList(session_handle, &mut needed, &mut count, infos.as_mut_ptr(), &mut reboot_reasons)
+                RmGetList(
+                    session_handle,
+                    &mut needed,
+                    &mut count,
+                    infos.as_mut_ptr(),
+                    &mut reboot_reasons,
+                )
             };
             if err == ERROR_SUCCESS {
                 let holders = infos
@@ -191,7 +209,10 @@ mod unix {
                 return Ok(Vec::new());
             }
             let pid = fl.l_pid as u32;
-            Ok(vec![DbHolder { pid, name: process_name(pid) }])
+            Ok(vec![DbHolder {
+                pid,
+                name: process_name(pid),
+            }])
         }
     }
 

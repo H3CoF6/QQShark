@@ -41,8 +41,12 @@ pub struct Algo {
     pub kdf: KdfHmac,
 }
 
-pub const ALL_PAGE_HMAC: [PageHmac; 4] =
-    [PageHmac::None, PageHmac::Sha1, PageHmac::Sha256, PageHmac::Sha512];
+pub const ALL_PAGE_HMAC: [PageHmac; 4] = [
+    PageHmac::None,
+    PageHmac::Sha1,
+    PageHmac::Sha256,
+    PageHmac::Sha512,
+];
 pub const ALL_KDF_HMAC: [KdfHmac; 3] = [KdfHmac::Sha1, KdfHmac::Sha256, KdfHmac::Sha512];
 
 impl PageHmac {

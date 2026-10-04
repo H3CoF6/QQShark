@@ -4,4 +4,4 @@ pub mod cipher;
 pub mod decrypt;
 
 pub use cipher::Algo;
-pub use decrypt::{detect_algo, decrypt_database, decrypt_wal};
+pub use decrypt::{decrypt_database, decrypt_wal, detect_algo};

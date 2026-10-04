@@ -87,7 +87,8 @@ struct ProcsArgs {
 
 #[derive(clap::Args)]
 struct CapArgs {
-    /// 抓包接口（Clash/Meta TUN 用 "Meta"；也可 "any"/"wlan0"/"eth0"）
+    /// 抓包接口：Linux 用 "Meta"/"any"/"wlan0"/"eth0"；Windows 用 Npcap 设备名
+    /// （形如 \Device\NPF_{GUID} 或网卡描述，先跑一次 capture 会列出全部设备）
     #[arg(short, long, default_value = "Meta")]
     iface: String,
     /// MSF 服务端口
@@ -118,6 +119,7 @@ struct CapArgs {
 
 #[derive(clap::Args)]
 struct LiveArgs {
+    /// 抓包接口：Linux 默认 "Meta"；Windows 需填 Npcap 设备名（见 capture 的输出）
     #[arg(short, long, default_value = "Meta")]
     iface: String,
     #[arg(short, long, default_value_t = 14000)]
@@ -145,8 +147,12 @@ fn hex16(s: &str) -> anyhow::Result<[u8; 16]> {
     }
     let mut out = [0u8; 16];
     for i in 0..16 {
-        let hi = (b[i * 2] as char).to_digit(16).ok_or_else(|| anyhow::anyhow!("bad hex"))?;
-        let lo = (b[i * 2 + 1] as char).to_digit(16).ok_or_else(|| anyhow::anyhow!("bad hex"))?;
+        let hi = (b[i * 2] as char)
+            .to_digit(16)
+            .ok_or_else(|| anyhow::anyhow!("bad hex"))?;
+        let lo = (b[i * 2 + 1] as char)
+            .to_digit(16)
+            .ok_or_else(|| anyhow::anyhow!("bad hex"))?;
         out[i] = ((hi << 4) | lo) as u8;
     }
     Ok(out)
@@ -185,10 +191,16 @@ fn hex_decode_loose(s: &str) -> anyhow::Result<Vec<u8>> {
         .trim_start_matches("0x")
         .trim_start_matches("0X")
         .to_string();
-    if clean.is_empty() || !clean.len().is_multiple_of(2) || !clean.chars().all(|c| c.is_ascii_hexdigit()) {
+    if clean.is_empty()
+        || !clean.len().is_multiple_of(2)
+        || !clean.chars().all(|c| c.is_ascii_hexdigit())
+    {
         anyhow::bail!("无效的 hex（需要偶数个十六进制字符）");
     }
-    Ok((0..clean.len()).step_by(2).map(|i| u8::from_str_radix(&clean[i..i + 2], 16).unwrap()).collect())
+    Ok((0..clean.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&clean[i..i + 2], 16).unwrap())
+        .collect())
 }
 
 fn cmd_decode(a: DecodeArgs) -> anyhow::Result<()> {
@@ -227,7 +239,11 @@ fn cmd_decode(a: DecodeArgs) -> anyhow::Result<()> {
     if a.hex {
         ui::section("hexdump");
         for line in plain.chunks(32).enumerate().map(|(i, c)| {
-            let h: String = c.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ");
+            let h: String = c
+                .iter()
+                .map(|x| format!("{x:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
             format!("{:04x}  {h}", i * 32)
         }) {
             println!("  {line}");
@@ -291,10 +307,10 @@ fn cmd_scan(a: ScanArgs) -> anyhow::Result<()> {
         None => {
             // 优先用 procs 映射出的唯一已登录进程。
             let all = process::scan_all(a.data_root.clone());
-            process::resolve_pid(&all.procs, None)
-                .or_else(|_| {
-                    scan::find_qq_pid().ok_or_else(|| anyhow::anyhow!("未找到 qq 进程，请用 --pid 指定"))
-                })?
+            process::resolve_pid(&all.procs, None).or_else(|_| {
+                scan::find_qq_pid()
+                    .ok_or_else(|| anyhow::anyhow!("未找到 qq 进程，请用 --pid 指定"))
+            })?
         }
     };
     ui::info(&format!("扫描 pid={pid} ..."));
@@ -306,7 +322,10 @@ fn cmd_scan(a: ScanArgs) -> anyhow::Result<()> {
         ui::field("pid", &pid.to_string());
         ui::field("wrapper base", &format!("0x{:x}", info.base));
         ui::field("instance", &format!("0x{:x}", info.instance));
-        ui::field("vtable", &format!("0x{:x}  (RVA 0x{:x})", info.vtable, info.vtable_rva));
+        ui::field(
+            "vtable",
+            &format!("0x{:x}  (RVA 0x{:x})", info.vtable, info.vtable_rva),
+        );
         ui::key_line("a2", &hex_bytes(&info.a2));
         ui::key_line("d2", &hex_bytes(&info.d2));
         ui::key_line("d2key", &info.d2key_hex);
@@ -324,7 +343,14 @@ fn cmd_procs(a: ProcsArgs) -> anyhow::Result<()> {
     if let Some(r) = &all.root {
         ui::field("数据目录", &r.display().to_string());
     }
-    ui::field("login.db", if all.accounts_loaded { "已解密" } else { "未读到（无 UIN 映射）" });
+    ui::field(
+        "login.db",
+        if all.accounts_loaded {
+            "已解密"
+        } else {
+            "未读到（无 UIN 映射）"
+        },
+    );
     ui::field("login 账号数", &all.accounts.len().to_string());
     ui::field("在线 QQ 进程", &all.procs.len().to_string());
     if all.procs.is_empty() {
@@ -333,10 +359,17 @@ fn cmd_procs(a: ProcsArgs) -> anyhow::Result<()> {
     for p in &all.procs {
         let role = if p.is_main { "主进程" } else { "占用者" };
         let uin = p.account_label();
-        let tag = if p.logged_in { "已登录" } else { "未确认" };
+        let tag = if p.logged_in {
+            "已登录"
+        } else {
+            "未确认"
+        };
         ui::field(
             &format!("pid {}", p.pid),
-            &format!("[{role}/{tag}] uin={uin} comm={}", if p.comm.is_empty() { "?" } else { &p.comm }),
+            &format!(
+                "[{role}/{tag}] uin={uin} comm={}",
+                if p.comm.is_empty() { "?" } else { &p.comm }
+            ),
         );
     }
     Ok(())
@@ -355,8 +388,7 @@ fn pick_pid(all: &process::ScanAll, wanted: Option<u32>) -> anyhow::Result<u32> 
         return Ok(p);
     }
     // 多个候选 → 交互选择。
-    let candidates: Vec<&process::ProcInfo> =
-        all.procs.iter().filter(|p| p.is_main).collect();
+    let candidates: Vec<&process::ProcInfo> = all.procs.iter().filter(|p| p.is_main).collect();
     if candidates.is_empty() {
         anyhow::bail!("未找到可用的 QQ 主进程，请用 --pid 指定");
     }
@@ -364,7 +396,16 @@ fn pick_pid(all: &process::ScanAll, wanted: Option<u32>) -> anyhow::Result<u32> 
     for (i, p) in candidates.iter().enumerate() {
         ui::field(
             &format!("[{}]", i + 1),
-            &format!("pid={} uin={} {}", p.pid, p.account_label(), if p.logged_in { "已登录" } else { "未确认" }),
+            &format!(
+                "pid={} uin={} {}",
+                p.pid,
+                p.account_label(),
+                if p.logged_in {
+                    "已登录"
+                } else {
+                    "未确认"
+                }
+            ),
         );
     }
     print!("  选择编号> ");
@@ -431,12 +472,23 @@ fn cmd_live(a: LiveArgs) -> anyhow::Result<()> {
     if let Some(r) = &all.root {
         ui::field("数据目录", &r.display().to_string());
     }
-    ui::field("login.db", if all.accounts_loaded { "已解密" } else { "未读到（无 UIN 映射）" });
+    ui::field(
+        "login.db",
+        if all.accounts_loaded {
+            "已解密"
+        } else {
+            "未读到（无 UIN 映射）"
+        },
+    );
     for p in &all.procs {
         let role = if p.is_main { "主进程" } else { "占用者" };
         ui::field(
             &format!("pid {}", p.pid),
-            &format!("[{role}{}] uin={}", if p.logged_in { "/已登录" } else { "" }, p.account_label()),
+            &format!(
+                "[{role}{}] uin={}",
+                if p.logged_in { "/已登录" } else { "" },
+                p.account_label()
+            ),
         );
     }
     let pid = pick_pid(&all, a.pid)?;
@@ -484,7 +536,11 @@ fn serde_json_like(info: &scan::SessionInfo) -> String {
 }
 
 fn procs_json(all: &process::ScanAll) -> String {
-    let root = all.root.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+    let root = all
+        .root
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     let procs: Vec<String> = all
         .procs
         .iter()
@@ -503,7 +559,9 @@ fn procs_json(all: &process::ScanAll) -> String {
         .collect();
     format!(
         "{{\"root\":\"{}\",\"accounts_loaded\":{},\"procs\":[{}]}}",
-        root, all.accounts_loaded, procs.join(",")
+        root,
+        all.accounts_loaded,
+        procs.join(",")
     )
 }
 

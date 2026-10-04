@@ -17,7 +17,11 @@ pub fn process_name(pid: u32) -> Option<String> {
     let mut buf = vec![0u8; MAXPATHLEN];
     // SAFETY: buffer is MAXPATHLEN bytes; proc_name writes a NUL-terminated string.
     let n = unsafe {
-        proc_name(pid as libc::c_int, buf.as_mut_ptr() as *mut libc::c_void, MAXPATHLEN as u32)
+        proc_name(
+            pid as libc::c_int,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            MAXPATHLEN as u32,
+        )
     };
     if n <= 0 {
         return None;
@@ -58,23 +62,38 @@ mod libproc {
         }
         let mut pids = vec![0i32; count as usize + 16];
         let n = unsafe {
-            proc_listallpids(pids.as_mut_ptr(), (pids.len() * size_of::<c_int>()) as c_int)
+            proc_listallpids(
+                pids.as_mut_ptr(),
+                (pids.len() * size_of::<c_int>()) as c_int,
+            )
         };
         if n <= 0 {
             return Vec::new();
         }
         pids.truncate(n as usize);
-        pids.into_iter().map(|pid| pid as u32).filter(|pid| is_qq_main_process(*pid)).collect()
+        pids.into_iter()
+            .map(|pid| pid as u32)
+            .filter(|pid| is_qq_main_process(*pid))
+            .collect()
     }
 
     fn is_qq_main_process(pid: u32) -> bool {
         let mut buf = [0u8; 4096];
-        let len =
-            unsafe { proc_pidpath(pid as c_int, buf.as_mut_ptr() as *mut c_void, buf.len() as u32) };
+        let len = unsafe {
+            proc_pidpath(
+                pid as c_int,
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len() as u32,
+            )
+        };
         if len <= 0 {
             return false;
         }
-        let end = buf.iter().position(|&b| b == 0).unwrap_or(len as usize).min(len as usize);
+        let end = buf
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(len as usize)
+            .min(len as usize);
         let Ok(path) = std::str::from_utf8(&buf[..end]) else {
             return false;
         };
@@ -126,13 +145,19 @@ mod ns_running_application {
             return Vec::new();
         }
 
-        let bundle_id =
-            unsafe { CFStringCreateWithCString(std::ptr::null(), QQ_BUNDLE_ID.as_ptr(), UTF8_ENCODING) };
+        let bundle_id = unsafe {
+            CFStringCreateWithCString(std::ptr::null(), QQ_BUNDLE_ID.as_ptr(), UTF8_ENCODING)
+        };
         if bundle_id.is_null() {
             return Vec::new();
         }
-        let apps =
-            unsafe { msg_send1(cls, sel(c"runningApplicationsWithBundleIdentifier:"), bundle_id) };
+        let apps = unsafe {
+            msg_send1(
+                cls,
+                sel(c"runningApplicationsWithBundleIdentifier:"),
+                bundle_id,
+            )
+        };
         unsafe { CFRelease(bundle_id) };
         if apps.is_null() {
             return Vec::new();
