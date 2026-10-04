@@ -399,19 +399,6 @@ impl PcapWriter {
     }
 }
 
-fn hexdump(b: &[u8]) -> Vec<String> {
-    let mut lines = Vec::new();
-    for (i, chunk) in b.chunks(32).enumerate() {
-        let hexs: String = chunk
-            .iter()
-            .map(|x| format!("{x:02x}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        lines.push(format!("{:04x}  {hexs}", i * 32));
-    }
-    lines
-}
-
 /// 权限相关错误的中文提示。
 fn open_error_hint(iface: &str, e: &str) -> String {
     #[cfg(unix)]
@@ -579,27 +566,21 @@ fn emit_frame(opts: &CaptureOpts, v: &FrameView<'_>) {
     }
 
     let mut body: Vec<String> = Vec::new();
-    // 默认：前 128 字节 hex，按每行 32 字节换行（有明文看明文，否则看原始帧）。
+    // 默认：hexdump 预览（前 128 字节，截断；有明文看明文，否则看原始帧）。
     let content = plain.unwrap_or(f);
+    let what = if plain.is_some() { "plain" } else { "raw" };
     body.push(format!(
-        "{}[0..128]:",
-        if plain.is_some() { "plain" } else { "raw" }
+        "{what} hexdump[0..128]：预览（截断，--hex 看完整）"
     ));
-    body.extend(codec::head_hex_lines(content, 128, 32));
+    body.extend(ui::hexdump_lines(content, 16, Some(128)));
 
+    // --hex：完整 hexdump，不截断。
     if opts.hex {
-        body.push(format!(
-            "{} {} 字节：",
-            if plain.is_some() {
-                "明文"
-            } else {
-                "原始帧"
-            },
-            content.len()
-        ));
-        body.extend(hexdump(content));
+        body.push(format!("{what} hexdump（完整 {} 字节）：", content.len()));
+        body.extend(ui::hexdump_lines(content, 16, None));
     }
 
+    // --expand：完整解析 protobuf/JCE 树，不截断。
     if opts.expand {
         match decoded {
             Some(d) if !d.body.is_empty() => match codec::decode_auto(&d.body) {
@@ -613,8 +594,11 @@ fn emit_frame(opts: &CaptureOpts, v: &FrameView<'_>) {
                             p.declared
                         ));
                     }
-                    body.push(format!("正文 {} 字节，按 {kind:?} 展开：", d.body.len()));
-                    body.extend(codec::render_tree(kind, &nodes, 24));
+                    body.push(format!(
+                        "正文 {} 字节，按 {kind:?} 完整展开：",
+                        d.body.len()
+                    ));
+                    body.extend(codec::render_tree(kind, &nodes));
                 }
                 None => body.push("(正文无法按 protobuf/JCE 解析)".to_string()),
             },
@@ -622,7 +606,7 @@ fn emit_frame(opts: &CaptureOpts, v: &FrameView<'_>) {
             None => {
                 if et != 1 {
                     body.push(format!(
-                        "(et={et} 未加密帧，无 TEA 密文；正文见上方 raw hex)"
+                        "(et={et} 未加密帧，无 TEA 密文；正文见上方 raw hexdump)"
                     ));
                 } else if plain.is_none() {
                     body.push("(et=1 但未提供 d2key，无法解密展开)".to_string());

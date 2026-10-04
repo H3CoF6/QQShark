@@ -724,113 +724,143 @@ fn hex(bytes: &[u8], max: usize) -> String {
     s
 }
 
-/// 前 `n` 字节的紧凑 hex（单行），超出部分标注省略量。
-pub fn head_hex(b: &[u8], n: usize) -> String {
-    if b.is_empty() {
-        return "(empty)".to_string();
-    }
-    let take = b.len().min(n);
-    let mut s = String::with_capacity(take * 3 + 16);
-    for (i, byte) in b[..take].iter().enumerate() {
-        if i > 0 {
-            s.push(' ');
-        }
-        s.push_str(&format!("{byte:02x}"));
-    }
-    if b.len() > take {
-        s.push_str(&format!(" … (+{}B)", b.len() - take));
-    }
-    s
-}
-
-/// 前 `n` 字节的 hex，按每行 `per_line` 字节换行（带行首偏移），超出部分标注。
-pub fn head_hex_lines(b: &[u8], n: usize, per_line: usize) -> Vec<String> {
-    if b.is_empty() {
-        return vec!["(empty)".to_string()];
-    }
-    let per_line = per_line.max(1);
-    let take = b.len().min(n);
-    let mut out = Vec::new();
-    for (li, chunk) in b[..take].chunks(per_line).enumerate() {
-        let hexs: String = chunk
-            .iter()
-            .map(|x| format!("{x:02x}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        out.push(format!("{:04x}  {hexs}", li * per_line));
-    }
-    if b.len() > take {
-        out.push(format!("… (+{}B)", b.len() - take));
-    }
-    out
-}
-
-/// 一个值的一行紧凑描述（不含嵌套展开）。
+/// 一个值的一行紧凑描述（含类型标注与颜色，不含嵌套展开）。
 pub fn value_summary(v: &RvValue) -> String {
+    use crate::ui::{paint, palette};
     match v {
         RvValue::Int { raw, bits, signed } => {
             let d = rv_int_display(*raw, *bits, *signed);
+            let ty = if *bits > 0 {
+                format!("int{bits}")
+            } else {
+                "int".to_string()
+            };
             match timestamp_range(*raw) {
-                Some((unit, _ms)) => format!("{d}  [ts {unit}]"),
-                None => format!("{d}"),
+                Some((unit, _ms)) => format!(
+                    "{} {} {}",
+                    paint(palette::num(), &d.to_string()),
+                    paint(palette::ty_num(), &ty),
+                    paint(palette::tag(), &format!("ts:{unit}"))
+                ),
+                None => format!(
+                    "{} {}",
+                    paint(palette::num(), &d.to_string()),
+                    paint(palette::ty_num(), &ty)
+                ),
             }
         }
-        RvValue::Float(f) => format!("{f}"),
-        RvValue::Fixed { bytes, bits } => format!("fixed{bits}=0x{}", hex(bytes, 16)),
-        RvValue::Str { text, .. } => format!("\"{}\"", text.replace('\n', "\\n")),
+        RvValue::Float(f) => format!(
+            "{} {}",
+            paint(palette::num(), &f.to_string()),
+            paint(palette::ty_num(), "float")
+        ),
+        RvValue::Fixed { bytes, bits } => format!(
+            "{} {}",
+            paint(palette::num(), &format!("0x{}", hex(bytes, 16))),
+            paint(palette::ty_num(), &format!("fixed{bits}"))
+        ),
+        RvValue::Str { text, .. } => format!(
+            "{} {}",
+            paint(
+                palette::ty_text(),
+                &format!("\"{}\"", text.replace('\n', "\\n"))
+            ),
+            paint(palette::ty_text(), "string")
+        ),
         RvValue::Bytes {
             bytes,
             nested,
             nested_kind,
         } => match (nested, nested_kind) {
-            (Some(n), Some(k)) => {
-                format!("bytes({}B) → {:?} 嵌套 {} 字段", bytes.len(), k, n.len())
-            }
+            (Some(n), Some(k)) => format!(
+                "{} {}",
+                paint(palette::ty_bytes(), &format!("bytes({}B)", bytes.len())),
+                paint(palette::punct(), &format!("→ {k:?} {} 字段", n.len()))
+            ),
             _ => {
                 if let Some(t) = try_utf8(bytes) {
-                    format!("\"{}\"", t.replace('\n', "\\n"))
+                    format!(
+                        "{} {}",
+                        paint(
+                            palette::ty_text(),
+                            &format!("\"{}\"", t.replace('\n', "\\n"))
+                        ),
+                        paint(palette::ty_text(), "string")
+                    )
                 } else {
-                    format!("bytes({}B) = {}", bytes.len(), hex(bytes, 16))
+                    format!(
+                        "{} {}",
+                        paint(palette::ty_bytes(), &format!("bytes({}B)", bytes.len())),
+                        paint(palette::num(), &format!("0x{}", hex(bytes, 16)))
+                    )
                 }
             }
         },
-        RvValue::Obj(f) => format!("{{ {} 字段 }}", f.len()),
-        RvValue::List(items) => format!("[ {} 项 ]", items.len()),
-        RvValue::Map(entries) => format!("{{ {} 对 }}", entries.len()),
+        RvValue::Obj(f) => format!(
+            "{} {}",
+            paint(palette::ty_container(), "message"),
+            paint(palette::dim(), &format!("{{ {} 字段 }}", f.len()))
+        ),
+        RvValue::List(items) => format!(
+            "{} {}",
+            paint(palette::ty_container(), "list"),
+            paint(palette::dim(), &format!("[ {} 项 ]", items.len()))
+        ),
+        RvValue::Map(entries) => format!(
+            "{} {}",
+            paint(palette::ty_container(), "map"),
+            paint(palette::dim(), &format!("{{ {} 对 }}", entries.len()))
+        ),
     }
 }
 
-/// 把解码树渲染成带缩进的多行文本，便于放进方框。
-pub fn render_tree(kind: Kind, nodes: &[RvNode], max_lines: usize) -> Vec<String> {
+/// 把解码树渲染成带缩进、带类型颜色的多行文本（完整展开，不截断）。
+pub fn render_tree(kind: Kind, nodes: &[RvNode]) -> Vec<String> {
+    use crate::ui::{paint, palette};
     let mut lines = Vec::new();
-    lines.push(format!("{:?} 树 ({} 顶层字段)", kind, nodes.len()));
-    render_nodes(nodes, 1, max_lines, &mut lines);
+    lines.push(format!(
+        "{} {}",
+        paint(palette::ty_container(), &format!("{kind:?}")),
+        paint(palette::dim(), &format!("树（{} 顶层字段）", nodes.len()))
+    ));
+    render_nodes(nodes, 1, &mut lines);
     lines
 }
 
-fn render_nodes(nodes: &[RvNode], depth: usize, max: usize, out: &mut Vec<String>) {
+fn render_nodes(nodes: &[RvNode], depth: usize, out: &mut Vec<String>) {
+    use crate::ui::{paint, palette};
+    let indent = "  ".repeat(depth);
     for n in nodes {
-        if out.len() >= max {
-            out.push(format!("{}…（已截断）", "  ".repeat(depth)));
-            return;
-        }
-        let indent = "  ".repeat(depth);
+        let tag = paint(palette::tag(), &format!("#{}", n.tag));
         match &n.value {
             RvValue::Obj(fields) => {
-                out.push(format!("{indent}#{}: {{ {} 字段 }}", n.tag, fields.len()));
-                render_nodes(fields, depth + 1, max, out);
+                out.push(format!(
+                    "{indent}{tag}: {} {}",
+                    paint(palette::ty_container(), "message"),
+                    paint(palette::dim(), &format!("{{ {} 字段 }}", fields.len()))
+                ));
+                render_nodes(fields, depth + 1, out);
             }
             RvValue::List(items) => {
-                out.push(format!("{indent}#{}: [ {} 项 ]", n.tag, items.len()));
-                render_nodes(items, depth + 1, max, out);
+                out.push(format!(
+                    "{indent}{tag}: {} {}",
+                    paint(palette::ty_container(), "list"),
+                    paint(palette::dim(), &format!("[ {} 项 ]", items.len()))
+                ));
+                render_nodes(items, depth + 1, out);
             }
             RvValue::Map(entries) => {
-                out.push(format!("{indent}#{}: map {} 对", n.tag, entries.len()));
+                out.push(format!(
+                    "{indent}{tag}: {} {}",
+                    paint(palette::ty_container(), "map"),
+                    paint(palette::dim(), &format!("{{ {} 对 }}", entries.len()))
+                ));
                 for (k, v) in entries {
                     out.push(format!(
-                        "{indent}  {} => #{} {}",
+                        "{indent}  {} {} {} {}",
                         value_summary(k),
-                        v.tag,
+                        paint(palette::punct(), "=>"),
+                        paint(palette::tag(), &format!("#{}", v.tag)),
                         value_summary(&v.value)
                     ));
                 }
@@ -841,14 +871,16 @@ fn render_nodes(nodes: &[RvNode], depth: usize, max: usize, out: &mut Vec<String
                 bytes,
             } => {
                 out.push(format!(
-                    "{indent}#{}: bytes({}B) → {:?}",
-                    n.tag,
-                    bytes.len(),
-                    nested_kind.unwrap_or(Kind::Protobuf)
+                    "{indent}{tag}: {} {}",
+                    paint(palette::ty_bytes(), &format!("bytes({}B)", bytes.len())),
+                    paint(
+                        palette::punct(),
+                        &format!("→ {:?}", nested_kind.unwrap_or(Kind::Protobuf))
+                    )
                 ));
-                render_nodes(nested, depth + 1, max, out);
+                render_nodes(nested, depth + 1, out);
             }
-            other => out.push(format!("{indent}#{}: {}", n.tag, value_summary(other))),
+            other => out.push(format!("{indent}{tag}: {}", value_summary(other))),
         }
     }
 }
@@ -936,9 +968,26 @@ mod tests {
     #[test]
     fn render_tree_includes_tags_and_nesting() {
         let nodes = decode_protobuf(&hex("089601"), 0).unwrap();
-        let lines = render_tree(Kind::Protobuf, &nodes, 10);
+        let lines = render_tree(Kind::Protobuf, &nodes);
         assert!(lines[0].contains("Protobuf"));
         assert!(lines[1].contains("#1"));
+        // 带颜色：字段号前应有 ANSI 起始序列。
+        assert!(lines[1].contains("\u{1b}["));
+    }
+
+    #[test]
+    fn render_tree_is_not_truncated() {
+        // 100 个 tag=1 的 varint 字段，全部应被渲染（无「已截断」标记）。
+        let mut buf = Vec::new();
+        for i in 0..100u8 {
+            buf.push(0x08);
+            buf.push(i);
+        }
+        let nodes = decode_protobuf(&buf, 0).unwrap();
+        assert_eq!(nodes.len(), 100);
+        let lines = render_tree(Kind::Protobuf, &nodes);
+        assert_eq!(lines.len(), 1 + 100);
+        assert!(!lines.iter().any(|l| l.contains("截断")));
     }
 
     #[test]
@@ -946,26 +995,6 @@ mod tests {
         assert_eq!(two_complement(0xff, 8), -1);
         assert_eq!(two_complement(0xffff_ffff, 32), -1);
         assert_eq!(two_complement(5, 32), 5);
-    }
-
-    #[test]
-    fn head_hex_truncates() {
-        let b: Vec<u8> = (0u8..200).collect();
-        let s = head_hex(&b, 128);
-        assert!(s.starts_with("00 01 02"));
-        assert!(s.contains("+72B"));
-        assert_eq!(head_hex(&[], 128), "(empty)");
-    }
-
-    #[test]
-    fn head_hex_lines_wraps_and_truncates() {
-        let b: Vec<u8> = (0u8..200).collect();
-        let lines = head_hex_lines(&b, 128, 32);
-        assert_eq!(lines.len(), 5); // 4 行 hex + 1 行省略
-        assert!(lines[0].starts_with("0000  00 01"));
-        assert!(lines[1].starts_with("0020  "));
-        assert_eq!(lines.last().unwrap(), "… (+72B)");
-        assert_eq!(head_hex_lines(&[], 128, 32), vec!["(empty)".to_string()]);
     }
 
     #[test]

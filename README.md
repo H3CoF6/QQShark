@@ -7,9 +7,9 @@ QQ NT 协议取证工具：**RTTI 自举密钥扫描** + **全进程 UIN 映射*
 
 - `scan`    运行时扫描某 pid 的 `a2` / `d2` / `d2key`（RTTI 自举，零硬编码 RVA）
 - `procs`   枚举全部在线 QQ 进程并映射到 UIN（`login.db` 解密 + 数据库占用探测）
-- `capture` 原始抓包 + MSF 帧解密（TUI 方框输出，默认前 128 字节 hex）
+- `capture` 原始抓包 + MSF 帧解密（TUI 方框输出，默认 hexdump 前 128 字节预览；`--hex` 完整 hexdump、`--expand` 完整展开）
 - `live`    一条龙：先扫进程与 UIN，再自动取 `d2key` 抓包
-- `decode`  在终端展开一段 hex：TEA 解密（可选）+ protobuf/JCE 解析
+- `decode`  在终端展开一段 hex：hexdump + TEA 解密（可选）+ protobuf/JCE 完整解析（`--hex`/`--expand`，默认仅预览）
 
 ## 构建
 
@@ -42,6 +42,11 @@ qqshark scan --json
 qqshark capture -i auto
 qqshark capture -i "Meta"
 qqshark capture -i "\Device\NPF_{...}" -n 20
+qqshark capture -i auto --hex --expand      # 完整 hexdump + 完整展开
+
+# 展开一段 hex：默认 hexdump 预览；--hex 完整 hexdump；--expand 完整解析
+qqshark decode "08 96 01 12 02 68 69" --expand
+qqshark decode - --hex < frame.hex
 ```
 
 ### Windows 抓包说明

@@ -27,6 +27,108 @@ fn gradient(t: f32) -> Style {
         .bold()
 }
 
+/// 结构化输出（hexdump / 解码树）的语义色板：不同用途用不同颜色，便于区分。
+pub mod palette {
+    use anstyle::{AnsiColor, Color, Style};
+
+    fn c(col: AnsiColor) -> Style {
+        Style::new().fg_color(Some(Color::Ansi(col)))
+    }
+
+    /// 暗色：偏移、省略标记、标点。
+    pub fn dim() -> Style {
+        c(AnsiColor::BrightBlack)
+    }
+    /// hexdump 行首偏移。
+    pub fn offset() -> Style {
+        dim()
+    }
+    /// hexdump 的十六进制字节。
+    pub fn hex() -> Style {
+        c(AnsiColor::Cyan)
+    }
+    /// hexdump 的可打印 ASCII。
+    pub fn ascii() -> Style {
+        c(AnsiColor::Green)
+    }
+    /// 解码树的字段号。
+    pub fn tag() -> Style {
+        c(AnsiColor::Yellow).bold()
+    }
+    /// 数值字面量。
+    pub fn num() -> Style {
+        c(AnsiColor::BrightWhite)
+    }
+    /// 整数/浮点/fixed 类型名。
+    pub fn ty_num() -> Style {
+        c(AnsiColor::BrightCyan)
+    }
+    /// 字符串类型名。
+    pub fn ty_text() -> Style {
+        c(AnsiColor::Green)
+    }
+    /// bytes 类型名。
+    pub fn ty_bytes() -> Style {
+        c(AnsiColor::Magenta)
+    }
+    /// message/struct/list/map 容器类型名。
+    pub fn ty_container() -> Style {
+        c(AnsiColor::Yellow)
+    }
+    /// 标点（箭头、括号等）。
+    pub fn punct() -> Style {
+        c(AnsiColor::BrightBlack)
+    }
+}
+
+/// 给一段文本套上颜色（返回带 ANSI 的字符串）。
+pub fn paint(style: Style, text: &str) -> String {
+    styled(style, text)
+}
+
+/// 渲染 hexdump：`偏移 + hex + ASCII`。`max` 为 `Some(n)` 时只预览前 `n` 字节
+/// 并在末尾标注省略量，`None` 表示完整渲染。返回的行已带颜色。
+pub fn hexdump_lines(bytes: &[u8], per_line: usize, max: Option<usize>) -> Vec<String> {
+    if bytes.is_empty() {
+        return vec![paint(palette::dim(), "(empty)")];
+    }
+    let per_line = per_line.max(1);
+    let take = max.map_or(bytes.len(), |m| m.min(bytes.len()));
+    let mut out = Vec::with_capacity(take / per_line + 2);
+    for (li, chunk) in bytes[..take].chunks(per_line).enumerate() {
+        let mut hexs = String::new();
+        for i in 0..per_line {
+            if i > 0 {
+                hexs.push(' ');
+            }
+            match chunk.get(i) {
+                Some(b) => hexs.push_str(&paint(palette::hex(), &format!("{b:02x}"))),
+                None => hexs.push_str("  "),
+            }
+        }
+        let mut ascii = String::new();
+        for &b in chunk {
+            let (ch, style) = if (0x20..=0x7e).contains(&b) {
+                (b as char, palette::ascii())
+            } else {
+                ('.', palette::dim())
+            };
+            ascii.push_str(&paint(style, &ch.to_string()));
+        }
+        out.push(format!(
+            "{}  {hexs}  {ascii}",
+            paint(palette::offset(), &format!("{:04x}", li * per_line))
+        ));
+    }
+    if bytes.len() > take {
+        out.push(paint(
+            palette::dim(),
+            &format!("… (+{}B)", bytes.len() - take),
+        ));
+    }
+    out
+}
+
 /// Print the big startup banner: gradient figlet art + a subtitle line.
 pub fn app_banner(subtitle: &str) {
     let mut out = anstream::stdout();
@@ -167,8 +269,25 @@ fn char_width(c: char) -> usize {
     }
 }
 
+/// 显示宽度：跳过 ANSI CSI 转义序列（颜色不计宽），其余按 `char_width` 累加。
 fn display_width(s: &str) -> usize {
-    s.chars().map(char_width).sum()
+    let mut width = 0;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for e in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&e) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        width += char_width(c);
+    }
+    width
 }
 
 fn pad_to(s: &str, cols: usize) -> String {
@@ -180,7 +299,8 @@ fn pad_to(s: &str, cols: usize) -> String {
     }
 }
 
-/// 纯文本方框（不含 ANSI，便于单测断言）。顶部 header 段用 ` · ` 连接。
+/// 方框渲染：正文可含 ANSI 颜色，宽度按可见字符计算（`display_width` 会跳过转义序列）。
+/// 顶部 header 段用 ` · ` 连接。
 pub fn render_box(dir: Dir, segments: &[String], body: &[String], min_width: usize) -> String {
     let head = format!("{} {} {}", dir.arrow(), dir.label(), segments.join(" · "));
     let head_w = display_width(&head);
@@ -291,6 +411,62 @@ mod tests {
         assert!(b.contains("RX") && b.contains("←"));
         let lines: Vec<&str> = b.lines().collect();
         assert_eq!(display_width(lines[0]), display_width(lines[1]));
+    }
+
+    #[test]
+    fn hexdump_has_offset_hex_ascii() {
+        // 每行 hex 段按 per_line 对齐：偏移 4 + 2 空格 + 16 字节 hex(47) + 2 空格 + ASCII 3 = 58
+        let lines = hexdump_lines(b"AB\n", 16, None);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(display_width(&lines[0]), 4 + 2 + 47 + 2 + 3);
+        assert!(lines[0].contains('A') && lines[0].contains('.'));
+        assert!(lines[0].contains("\u{1b}["));
+    }
+
+    #[test]
+    fn hexdump_preview_marks_truncation() {
+        let b: Vec<u8> = (0u8..200).collect();
+        let preview = hexdump_lines(&b, 16, Some(128));
+        assert_eq!(preview.len(), 9); // 8 行 hex + 1 行省略
+        assert!(preview.last().unwrap().contains("(+72B)"));
+
+        let full = hexdump_lines(&b, 16, None);
+        assert_eq!(full.len(), 13); // ceil(200/16) == 13，无省略行
+        assert!(!full.iter().any(|l| l.contains("\u{2026} (+")));
+    }
+
+    #[test]
+    fn hexdump_empty() {
+        let lines = hexdump_lines(&[], 32, None);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("(empty)"));
+    }
+
+    #[test]
+    fn ansi_sequences_do_not_count_toward_width() {
+        let plain = "0000  41 42 43";
+        let painted = format!(
+            "{}{}{}{}",
+            paint(palette::offset(), "0000"),
+            "  ",
+            paint(palette::hex(), "41 42 43"),
+            ""
+        );
+        assert_eq!(display_width(plain), display_width(&painted));
+    }
+
+    #[test]
+    fn colored_hexdump_fits_box() {
+        // 集成：带 ANSI 的 hexdump 行放进方框后，各显示宽度仍需一致。
+        let body = hexdump_lines(b"GET / HTTP/1.1\r\n\r\n", 16, None);
+        let b = render_box(Dir::Tx, &["seq=1".into()], &body, 0);
+        let lines: Vec<&str> = b.lines().collect();
+        let w = display_width(lines[0]);
+        for l in &lines {
+            assert_eq!(display_width(l), w, "line width mismatch: {l:?}");
+        }
+        // ASCII 逐字符着色，故只断言字符存在，不断言连续子串。
+        assert!(b.contains('G') && b.contains('E') && b.contains('T'));
     }
 
     #[test]

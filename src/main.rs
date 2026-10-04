@@ -27,9 +27,9 @@ use clap::{Parser, Subcommand};
     long_about = "非侵入式逆向/取证 QQ NT 协议。\n\
     · scan    运行时扫描某 pid 的 a2/d2/d2key（RTTI 自举，零硬编码 RVA）\n\
     · procs   枚举全部在线 QQ 进程并映射到 UIN（login.db 解密 + 锁探测）\n\
-    · capture 原始抓包 + MSF 帧解密（TUI 方框输出，默认前 128 字节 hex，Ctrl+C/ESC 结束）\n\
+    · capture 原始抓包 + MSF 帧解密（TUI 方框输出，默认 hexdump 前 128 字节预览，Ctrl+C/ESC 结束）\n\
     · live    一条龙：先扫进程与 UIN，再自动取 d2key 抓包\n\
-    · decode  在终端展开一段 hex：TEA 解密（可选）+ protobuf/JCE 解析"
+    · decode  在终端展开一段 hex：hexdump + TEA 解密（可选）+ protobuf/JCE 完整解析"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -46,7 +46,7 @@ enum Cmd {
     Capture(CapArgs),
     /// 一条龙：先扫后抓
     Live(LiveArgs),
-    /// 在终端展开一段 hex：TEA 解密（可选）+ protobuf/JCE 解析
+    /// 在终端展开一段 hex：hexdump + TEA 解密（可选）+ protobuf/JCE 完整解析
     Decode(DecodeArgs),
 }
 
@@ -57,9 +57,12 @@ struct DecodeArgs {
     /// 帧密文的 d2key（32 字符 hex）。提供则先按 MSF 帧 TEA 解密再解析
     #[arg(long)]
     d2key: Option<String>,
-    /// 打印完整 hexdump
+    /// 打印完整 hexdump（不截断）
     #[arg(long)]
     hex: bool,
+    /// 完整解析正文的 protobuf/JCE 树（不截断）
+    #[arg(long)]
+    expand: bool,
 }
 
 #[derive(clap::Args)]
@@ -106,10 +109,10 @@ struct CapArgs {
     /// 把原始包写入 pcap 文件
     #[arg(short, long)]
     write: Option<PathBuf>,
-    /// 额外打印解密后的明文 hex
+    /// 额外打印完整的明文 hexdump（不截断）
     #[arg(long)]
     hex: bool,
-    /// 展开正文的 protobuf/JCE 树
+    /// 完整展开正文的 protobuf/JCE 树（不截断）
     #[arg(long)]
     expand: bool,
     /// 抓到 N 个帧后退出（调试用）
@@ -209,6 +212,12 @@ fn hex_decode_loose(s: &str) -> anyhow::Result<Vec<u8>> {
         .collect())
 }
 
+fn print_indented(lines: &[String]) {
+    for line in lines {
+        println!("  {line}");
+    }
+}
+
 fn cmd_decode(a: DecodeArgs) -> anyhow::Result<()> {
     let raw = if a.input == "-" {
         let mut s = String::new();
@@ -221,9 +230,10 @@ fn cmd_decode(a: DecodeArgs) -> anyhow::Result<()> {
 
     ui::section("输入");
     ui::field("字节数", &bytes.len().to_string());
-    ui::field("hex[0..128]", &codec::head_hex(&bytes, 128));
+    ui::field("hexdump[0..128]", "预览（截断，--hex 看完整）");
+    print_indented(&ui::hexdump_lines(&bytes, 16, Some(128)));
 
-    // 可选：TEA 解密。既能吃完整 MSF 帧（自动取其中的密文），也能吃裸密文。
+    // 可选：TEA 解密。既能吃完整 MSF 帧（自动取其密文），也能吃裸密文。
     let mut plain = bytes.clone();
     if let Some(k) = &a.d2key {
         let key = hex16(k)?;
@@ -239,70 +249,63 @@ fn cmd_decode(a: DecodeArgs) -> anyhow::Result<()> {
         };
         plain = tea::decrypt(&cipher, &key);
         ui::ok(&format!("TEA 解密完成，明文 {} 字节", plain.len()));
-        ui::field("plain[0..128]", &codec::head_hex(&plain, 128));
+        ui::field("plain hexdump[0..128]", "预览（截断）");
+        print_indented(&ui::hexdump_lines(&plain, 16, Some(128)));
     }
 
+    // --hex：完整 hexdump（明文优先，否则原始字节），不截断。
     if a.hex {
-        ui::section("hexdump");
-        for line in plain.chunks(32).enumerate().map(|(i, c)| {
-            let h: String = c
-                .iter()
-                .map(|x| format!("{x:02x}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            format!("{:04x}  {h}", i * 32)
-        }) {
-            println!("  {line}");
-        }
+        let target = &plain;
+        ui::section(&format!("hexdump（完整 {} 字节）", target.len()));
+        print_indented(&ui::hexdump_lines(target, 16, None));
     }
 
-    ui::section("展开");
-    // 1) 尝试当作 SsoPacker 明文取 body（仅在确实识别出 SSO 头时才走这条）
-    if let Some(d) = frame::decode_plain(&plain)
-        && (d.cmd.is_some() || !d.body.is_empty())
-    {
-        if let Some(cmd) = &d.cmd {
-            ui::key_line("cmd", cmd);
-        }
-        ui::field("body", &format!("{} 字节", d.body.len()));
-        if !d.body.is_empty() {
-            match codec::decode_auto(&d.body) {
-                Some((kind, nodes, prefix)) => {
-                    if let Some(p) = prefix {
-                        ui::info(&format!(
-                            "剥离 {} 字节{}长度前缀（值 {} = {}）",
-                            p.width,
-                            if p.endian == "be" { "大端" } else { "小端" },
-                            p.value,
-                            p.declared
-                        ));
+    // --expand：完整解析 protobuf/JCE 树，不截断。
+    if a.expand {
+        ui::section("展开");
+        // 1) 尝试当作 SsoPacker 明文取 body（仅在确实识别出 SSO 头时才走这条）
+        if let Some(d) = frame::decode_plain(&plain)
+            && (d.cmd.is_some() || !d.body.is_empty())
+        {
+            if let Some(cmd) = &d.cmd {
+                ui::key_line("cmd", cmd);
+            }
+            ui::field("body", &format!("{} 字节", d.body.len()));
+            if !d.body.is_empty() {
+                match codec::decode_auto(&d.body) {
+                    Some((kind, nodes, prefix)) => {
+                        if let Some(p) = prefix {
+                            ui::info(&format!(
+                                "剥离 {} 字节{}长度前缀（值 {} = {}）",
+                                p.width,
+                                if p.endian == "be" { "大端" } else { "小端" },
+                                p.value,
+                                p.declared
+                            ));
+                        }
+                        print_indented(&codec::render_tree(kind, &nodes));
+                        return Ok(());
                     }
-                    for line in codec::render_tree(kind, &nodes, 64) {
-                        println!("  {line}");
-                    }
-                    return Ok(());
+                    None => ui::warn("body 无法按 protobuf/JCE 解析，改试整体解析。"),
                 }
-                None => ui::warn("body 无法按 protobuf/JCE 解析，改试整体解析。"),
             }
         }
-    }
-    // 2) 整体按 protobuf/JCE
-    match codec::decode_auto(&plain) {
-        Some((kind, nodes, prefix)) => {
-            if let Some(p) = prefix {
-                ui::info(&format!(
-                    "剥离 {} 字节{}长度前缀（值 {} = {}）",
-                    p.width,
-                    if p.endian == "be" { "大端" } else { "小端" },
-                    p.value,
-                    p.declared
-                ));
+        // 2) 整体按 protobuf/JCE
+        match codec::decode_auto(&plain) {
+            Some((kind, nodes, prefix)) => {
+                if let Some(p) = prefix {
+                    ui::info(&format!(
+                        "剥离 {} 字节{}长度前缀（值 {} = {}）",
+                        p.width,
+                        if p.endian == "be" { "大端" } else { "小端" },
+                        p.value,
+                        p.declared
+                    ));
+                }
+                print_indented(&codec::render_tree(kind, &nodes));
             }
-            for line in codec::render_tree(kind, &nodes, 64) {
-                println!("  {line}");
-            }
+            None => ui::warn("无法按 protobuf 或 JCE 解析该输入。"),
         }
-        None => ui::warn("无法按 protobuf 或 JCE 解析该输入。"),
     }
     Ok(())
 }
