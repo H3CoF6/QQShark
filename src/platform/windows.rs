@@ -140,7 +140,7 @@ pub fn pid_alive(pid: u32) -> bool {
 /// `{XXXXXXXX-....}`（大写）的适配器名，可拼成 Npcap 设备名。
 pub fn default_route_guids() -> Vec<String> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        GetAdaptersAddresses, GetBestInterface, GetBestInterfaceEx, GAA_FLAG_INCLUDE_PREFIX,
+        GAA_FLAG_INCLUDE_PREFIX, GetAdaptersAddresses, GetBestInterface, GetBestInterfaceEx,
         IP_ADAPTER_ADDRESSES_LH,
     };
     use windows_sys::Win32::Networking::WinSock::{AF_INET6, AF_UNSPEC, SOCKADDR_IN6};
@@ -156,12 +156,12 @@ pub fn default_route_guids() -> Vec<String> {
     let mut sin6: SOCKADDR_IN6 = unsafe { std::mem::zeroed() };
     sin6.sin6_family = AF_INET6;
     // 2001:4860:4860::8888
-    sin6.sin6_addr.u.Byte = [0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88];
+    sin6.sin6_addr.u.Byte = [
+        0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88,
+    ];
     let mut idx6: u32 = 0;
     // SAFETY: SOCKADDR_IN6 outlives the call; out-param write.
-    let r6 = unsafe {
-        GetBestInterfaceEx(&sin6 as *const _ as *const _, &mut idx6)
-    };
+    let r6 = unsafe { GetBestInterfaceEx(&sin6 as *const _ as *const _, &mut idx6) };
     let idx6 = (r6 == 0).then_some(idx6);
 
     // 枚举适配器，按索引取 GUID。

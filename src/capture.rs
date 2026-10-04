@@ -480,14 +480,18 @@ fn device_matches(d: &pcap::Device, iface: &str) -> bool {
         return true;
     }
     if d.desc.as_deref() == Some(iface)
-        || d.desc.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(iface))
+        || d.desc
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case(iface))
     {
         return true;
     }
     // 兜底：设备名 / 描述包含给定关键字（如 "WLAN"、"Ethernet"）。
     let needle = iface.to_ascii_uppercase();
     d.name.to_ascii_uppercase().contains(&needle)
-        || d.desc.as_deref().is_some_and(|s| s.to_ascii_uppercase().contains(&needle))
+        || d.desc
+            .as_deref()
+            .is_some_and(|s| s.to_ascii_uppercase().contains(&needle))
 }
 
 /// 自动挑选抓包设备：优先默认路由出口网卡，其次第一个非回环设备。
@@ -506,10 +510,11 @@ fn pick_auto_device(list: &[pcap::Device]) -> Option<usize> {
             if let Some(i) = list.iter().position(|d| d.name.eq_ignore_ascii_case(&want)) {
                 return Some(i);
             }
-            if let Some(i) = list
-                .iter()
-                .position(|d| d.name.to_ascii_uppercase().contains(&guid.to_ascii_uppercase()))
-            {
+            if let Some(i) = list.iter().position(|d| {
+                d.name
+                    .to_ascii_uppercase()
+                    .contains(&guid.to_ascii_uppercase())
+            }) {
                 return Some(i);
             }
         }
