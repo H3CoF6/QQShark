@@ -487,6 +487,49 @@ pub fn check_capture_privileges(iface: &str) -> bool {
     }
 }
 
+/// 设备名 / 描述是否匹配用户提供的接口名。
+fn device_matches(d: &pcap::Device, iface: &str) -> bool {
+    if d.name == iface || d.name.eq_ignore_ascii_case(iface) {
+        return true;
+    }
+    if d.desc.as_deref() == Some(iface)
+        || d.desc.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(iface))
+    {
+        return true;
+    }
+    // 兜底：设备名 / 描述包含给定关键字（如 "WLAN"、"Ethernet"）。
+    let needle = iface.to_ascii_uppercase();
+    d.name.to_ascii_uppercase().contains(&needle)
+        || d.desc.as_deref().is_some_and(|s| s.to_ascii_uppercase().contains(&needle))
+}
+
+/// 自动挑选抓包设备：优先默认路由出口网卡，其次第一个非回环设备。
+fn pick_auto_device(list: &[pcap::Device]) -> Option<usize> {
+    let is_loopback = |d: &pcap::Device| {
+        let name = d.name.to_ascii_lowercase();
+        let desc = d.desc.as_deref().unwrap_or("").to_ascii_lowercase();
+        name.contains("loopback") || desc.contains("loopback")
+    };
+
+    #[cfg(windows)]
+    {
+        // 默认路由网卡的适配器 GUID → Npcap 设备名 `\Device\NPF_{GUID}`。
+        for guid in crate::platform::default_route_guids() {
+            let want = format!("\\Device\\NPF_{guid}");
+            if let Some(i) = list.iter().position(|d| d.name.eq_ignore_ascii_case(&want)) {
+                return Some(i);
+            }
+            if let Some(i) = list
+                .iter()
+                .position(|d| d.name.to_ascii_uppercase().contains(&guid.to_ascii_uppercase()))
+            {
+                return Some(i);
+            }
+        }
+    }
+
+    list.iter().position(|d| !is_loopback(d))
+}
 fn dir_of(is_c2s: bool) -> Dir {
     if is_c2s { Dir::Tx } else { Dir::Rx }
 }
@@ -597,28 +640,40 @@ pub fn run(opts: CaptureOpts) -> anyhow::Result<()> {
     let _guard = RawGuard::new();
     spawn_key_watcher();
 
-    // 若接口名无效（Windows 上常见：需要 Npcap 设备名），列出可用设备帮助定位。
-    let device = match pcap::Device::list().map(|list| {
-        list.into_iter().find(|d| {
-            d.name == opts.iface
-                || d.desc.as_deref() == Some(opts.iface.as_str())
-                || d.name.eq_ignore_ascii_case(&opts.iface)
-        })
-    }) {
-        Ok(Some(d)) => d,
-        Ok(None) => {
-            ui::warn(&format!("未找到接口 '{}'，可用设备如下：", opts.iface));
-            match pcap::Device::list() {
-                Ok(list) => {
+    // 解析接口：`auto`/空 → 自动选默认出口网卡；否则按名字或描述匹配。
+    let auto = opts.iface.is_empty() || opts.iface.eq_ignore_ascii_case("auto");
+    let device = match pcap::Device::list() {
+        Ok(list) => {
+            let picked = if auto {
+                pick_auto_device(&list)
+            } else {
+                list.iter().position(|d| device_matches(d, &opts.iface))
+            };
+            match picked {
+                Some(i) => {
+                    if auto {
+                        ui::info(&format!(
+                            "自动选择接口：{} ({})",
+                            list[i].name,
+                            list[i].desc.as_deref().unwrap_or("-")
+                        ));
+                    }
+                    list[i].clone()
+                }
+                None => {
+                    ui::warn(&format!("未找到接口 '{}'，可用设备如下：", opts.iface));
                     for d in &list {
                         ui::field(&d.name, d.desc.as_deref().unwrap_or(""));
                     }
+                    anyhow::bail!("请用上表中的设备名作为 -i/--iface 重试（或 -i auto 自动选择）");
                 }
-                Err(e) => ui::warn(&format!("枚举设备失败：{e}")),
             }
-            anyhow::bail!("请用上表中的设备名作为 -i/--iface 重试");
         }
         Err(_) => pcap::Device::from(opts.iface.as_str()),
+    };
+    let device_label = match &device.desc {
+        Some(d) => format!("{} ({})", device.name, d),
+        None => device.name.clone(),
     };
     let mut cap = pcap::Capture::from_device(device)
         .context("open device")?
@@ -627,7 +682,7 @@ pub fn run(opts: CaptureOpts) -> anyhow::Result<()> {
         .snaplen(65535)
         .timeout(500)
         .open()
-        .map_err(|e| anyhow::anyhow!(open_error_hint(&opts.iface, &e.to_string())))?;
+        .map_err(|e| anyhow::anyhow!(open_error_hint(&device_label, &e.to_string())))?;
 
     let filter = format!("tcp port {}", opts.port);
     cap.filter(&filter, true)
@@ -636,7 +691,7 @@ pub fn run(opts: CaptureOpts) -> anyhow::Result<()> {
     let lt = linktype.0;
     let l2 = l2_offset(lt);
     ui::section("抓包");
-    ui::field("接口", &opts.iface);
+    ui::field("接口", &device_label);
     ui::field("过滤", &filter);
     ui::field("链路层", &format!("linktype={lt} (l2={l2})"));
     ui::field(

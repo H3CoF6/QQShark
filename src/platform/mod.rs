@@ -7,7 +7,7 @@
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::find_wrapper_node_pids;
+pub use windows::{default_route_guids, find_wrapper_node_pids};
 
 #[cfg(target_os = "linux")]
 mod linux;

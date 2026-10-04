@@ -1,4 +1,4 @@
-﻿# qqshark
+# qqshark
 
 QQ NT 协议取证工具：**RTTI 自举密钥扫描** + **全进程 UIN 映射** + **原始抓包解密**。
 非侵入式，运行时自举，零硬编码 RVA。支持 Linux / macOS / Windows。
@@ -38,15 +38,18 @@ qqshark procs
 qqshark scan --pid 28508
 qqshark scan --json
 
-# 抓包并解密（Linux 默认接口 Meta；Windows 需填 Npcap 设备名）
+# 抓包并解密（默认 `auto`：自动选默认出口网卡；Linux 也兼容 "Meta"）
+qqshark capture -i auto
 qqshark capture -i "Meta"
 qqshark capture -i "\Device\NPF_{...}" -n 20
 ```
 
 ### Windows 抓包说明
 
-- 先跑一次 `qqshark capture`（不给 `-i`）会列出全部 Npcap 设备名，挑物理网卡或
-  代理/TUN 对应的虚拟网卡。
+- 默认 `-i auto` 会自动选中默认出口网卡（经 `GetBestInterface` 解析路由后的
+  适配器 GUID，再映射到 Npcap 的 `\Device\NPF_{GUID}`），无需手填设备名。
+- 想手动指定时可先跑一次 `qqshark capture`（不给 `-i`）列出全部 Npcap 设备名，
+  挑物理网卡或代理/TUN 对应的虚拟网卡。
 - 若只列出“回环适配器（Adapter for loopback traffic capture）”：说明 Npcap 未把
   物理网卡暴露给 WinPcap 兼容层，重装 Npcap 并勾选安装到所有网卡即可。
 - 结束抓包：`Ctrl+C` 或按 `ESC` / `q`（与 Linux 行为一致）。

@@ -87,9 +87,9 @@ struct ProcsArgs {
 
 #[derive(clap::Args)]
 struct CapArgs {
-    /// 抓包接口：Linux 用 "Meta"/"any"/"wlan0"/"eth0"；Windows 用 Npcap 设备名
-    /// （形如 \Device\NPF_{GUID} 或网卡描述，先跑一次 capture 会列出全部设备）
-    #[arg(short, long, default_value = "Meta")]
+    /// 抓包接口：`auto` 自动选默认出口网卡；Linux 也可用 "Meta"/"any"/"wlan0"/"eth0"；
+    /// Windows 也可用 Npcap 设备名（形如 \Device\NPF_{GUID} 或网卡描述）
+    #[arg(short, long, default_value = DEFAULT_IFACE)]
     iface: String,
     /// MSF 服务端口
     #[arg(short, long, default_value_t = 14000)]
@@ -119,8 +119,9 @@ struct CapArgs {
 
 #[derive(clap::Args)]
 struct LiveArgs {
-    /// 抓包接口：Linux 默认 "Meta"；Windows 需填 Npcap 设备名（见 capture 的输出）
-    #[arg(short, long, default_value = "Meta")]
+    /// 抓包接口：`auto` 自动选默认出口网卡；Linux 也可用 "Meta"/"any"/"wlan0"/"eth0"；
+    /// Windows 也可用 Npcap 设备名（形如 \Device\NPF_{GUID} 或网卡描述）
+    #[arg(short, long, default_value = DEFAULT_IFACE)]
     iface: String,
     #[arg(short, long, default_value_t = 14000)]
     port: u16,
@@ -139,6 +140,11 @@ struct LiveArgs {
     count: Option<usize>,
 }
 
+/// 默认抓包接口：Windows 自动选默认出口网卡，其余平台沿用 Linux 的 "Meta"。
+#[cfg(windows)]
+const DEFAULT_IFACE: &str = "auto";
+#[cfg(not(windows))]
+const DEFAULT_IFACE: &str = "Meta";
 fn hex16(s: &str) -> anyhow::Result<[u8; 16]> {
     let s = s.trim();
     let b = s.as_bytes();

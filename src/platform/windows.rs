@@ -132,3 +132,84 @@ pub fn pid_alive(pid: u32) -> bool {
         }
     }
 }
+
+/// 解析默认路由所在的网卡 GUID（用于把 `\Device\NPF_{GUID}` 自动对上）。
+///
+/// 先按 IPv4 默认路由（`GetBestInterface` → 8.8.8.8）匹配，再按 IPv6 默认路由
+/// （`GetBestInterfaceEx` → 2001:4860:4860::8888）匹配；返回形如
+/// `{XXXXXXXX-....}`（大写）的适配器名，可拼成 Npcap 设备名。
+pub fn default_route_guids() -> Vec<String> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetAdaptersAddresses, GetBestInterface, GetBestInterfaceEx, GAA_FLAG_INCLUDE_PREFIX,
+        IP_ADAPTER_ADDRESSES_LH,
+    };
+    use windows_sys::Win32::Networking::WinSock::{AF_INET6, AF_UNSPEC, SOCKADDR_IN6};
+
+    // 目标索引：IPv4 8.8.8.8 / IPv6 2001:4860:4860::8888。
+    let mut idx4: u32 = 0;
+    // GetBestInterface 的地址参数用网络字节序。
+    let dest4 = u32::from_be_bytes([8, 8, 8, 8]);
+    // SAFETY: single out-param write.
+    let r4 = unsafe { GetBestInterface(dest4, &mut idx4) };
+    let idx4 = (r4 == 0).then_some(idx4);
+
+    let mut sin6: SOCKADDR_IN6 = unsafe { std::mem::zeroed() };
+    sin6.sin6_family = AF_INET6;
+    // 2001:4860:4860::8888
+    sin6.sin6_addr.u.Byte = [0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88];
+    let mut idx6: u32 = 0;
+    // SAFETY: SOCKADDR_IN6 outlives the call; out-param write.
+    let r6 = unsafe {
+        GetBestInterfaceEx(&sin6 as *const _ as *const _, &mut idx6)
+    };
+    let idx6 = (r6 == 0).then_some(idx6);
+
+    // 枚举适配器，按索引取 GUID。
+    let mut size: u32 = 16 * 1024;
+    let mut buf = vec![0u8; size as usize];
+    // SAFETY: two-call GetAdaptersAddresses pattern with a properly sized buffer.
+    let ret = unsafe {
+        GetAdaptersAddresses(
+            AF_UNSPEC as u32,
+            GAA_FLAG_INCLUDE_PREFIX,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
+            &mut size,
+        )
+    };
+    if ret != 0 {
+        buf = vec![0u8; size as usize];
+        let ret2 = unsafe {
+            GetAdaptersAddresses(
+                AF_UNSPEC as u32,
+                GAA_FLAG_INCLUDE_PREFIX,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
+                &mut size,
+            )
+        };
+        if ret2 != 0 {
+            return Vec::new();
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut cur = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+    while !cur.is_null() {
+        // SAFETY: walking the linked list returned by GetAdaptersAddresses.
+        let a = unsafe { &*cur };
+        let ifindex = unsafe { a.Anonymous1.Anonymous.IfIndex };
+        let matches = idx4 == Some(ifindex) || idx6 == Some(a.Ipv6IfIndex);
+        if matches && !a.AdapterName.is_null() {
+            // SAFETY: AdapterName is a NUL-terminated ANSI string.
+            let name = unsafe { std::ffi::CStr::from_ptr(a.AdapterName as *const i8) }
+                .to_string_lossy()
+                .to_ascii_uppercase();
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+        cur = a.Next;
+    }
+    out
+}
