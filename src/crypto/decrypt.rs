@@ -160,7 +160,7 @@ fn wal_checksum(seed: [u32; 2], chunks: [&[u8]; 2], little_endian: bool) -> [u32
     };
     let mut s = seed;
     for src in chunks {
-        for pair in src.chunks_exact(8) {
+        for pair in src.as_chunks::<8>().0 {
             let (w0, w1) = (word(&pair[..4]), word(&pair[4..]));
             s[0] = s[0].wrapping_add(w0).wrapping_add(s[1]);
             s[1] = s[1].wrapping_add(w1).wrapping_add(s[0]);
