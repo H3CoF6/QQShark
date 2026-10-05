@@ -252,12 +252,12 @@ fn read_i64(mem: &Mem, addr: u64) -> Option<i64> {
 /// 读取字符串风格字段。
 ///
 /// * Windows：`+0` 为长度、`+8` 为数据指针。
-/// * Linux：`+8` 为长度、`+0x10` 为数据指针。
+/// * Linux/macOS：`+0` 为数据指针、`+8` 为长度、`+0x10` 为容量/标志。
 fn read_qstring(mem: &Mem, addr: u64) -> Option<Vec<u8>> {
     #[cfg(windows)]
     let (sz, ptr) = (read_u64(mem, addr)?, read_u64(mem, addr + 8)?);
     #[cfg(not(windows))]
-    let (sz, ptr) = (read_u64(mem, addr + 8)?, read_u64(mem, addr + 16)?);
+    let (ptr, sz) = (read_u64(mem, addr)?, read_u64(mem, addr + 8)?);
     if ptr == 0 || sz == 0 || sz > 4096 {
         return None;
     }
