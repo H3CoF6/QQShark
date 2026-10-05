@@ -2,6 +2,8 @@
 //!
 //! * Linux（Itanium C++ ABI / ELF）：磁盘搜 `N2nt12SessionForNtE`，再按
 //!   typeinfo -> vtable -> 实例 逐级反查。
+//! * macOS（Itanium C++ ABI / Mach-O）：与 Linux 同理，但直接从内存搜
+//!   `N2nt12SessionForNtE`（wrapper.node 是 universal 二进制，磁盘偏移映射不可靠）。
 //! * Windows（MSVC C++ ABI / PE）：内存搜 `.?AVSessionForNt@nt@@`，定位
 //!   RTTI Type Descriptor，再经 Complete Object Locator -> vtable -> 实例。
 //!
@@ -9,7 +11,7 @@
 //! a2 / d2 / d2key 三个字段。
 
 use std::collections::BTreeSet;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::fs;
 
 const CHUNK: usize = 1024 * 1024;
@@ -17,8 +19,10 @@ const CHUNK: usize = 1024 * 1024;
 /// 私有堆区间上限（超过则跳过，避免读进超大保留区）。
 #[cfg(windows)]
 const MAX_HEAP_REGION: u64 = 256 * 1024 * 1024;
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 const MAX_HEAP_REGION: u64 = 4 * 1024 * 1024;
+#[cfg(target_os = "macos")]
+const MAX_HEAP_REGION: u64 = 64 * 1024 * 1024;
 
 /// Itanium ABI 的 mangled typeinfo 名（Linux/ELF）。
 #[cfg(not(windows))]
@@ -46,17 +50,19 @@ struct Region {
     start: u64,
     end: u64,
     perms: String,
-    #[cfg_attr(windows, allow(dead_code))]
+    #[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
     off: u64,
     path: String,
 }
 
 /// 目标进程的可读内存句柄 + 读接口。
 struct Mem {
-    #[cfg_attr(windows, allow(dead_code))]
+    #[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
     pid: u32,
     #[cfg(windows)]
     handle: windows_sys::Win32::Foundation::HANDLE,
+    #[cfg(target_os = "macos")]
+    task: libc::mach_port_t,
 }
 
 impl Mem {
@@ -76,7 +82,18 @@ impl Mem {
             }
             Some(Mem { pid, handle })
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        {
+            let mut task: libc::mach_port_t = 0;
+            // SAFETY: task_for_pid writes a send right into `task` on success. Root
+            // (or a signed debugger) is required; hardened-runtime targets may deny it.
+            let kr = unsafe { task_for_pid_ffi(self_mach_task(), pid as libc::pid_t, &mut task) };
+            if kr != 0 || task == 0 {
+                return None;
+            }
+            Some(Mem { pid, task })
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
         {
             Some(Mem { pid })
         }
@@ -86,7 +103,7 @@ impl Mem {
         if size == 0 {
             return Some(Vec::new());
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
             let mut buf = vec![0u8; size];
             let local = libc::iovec {
@@ -104,6 +121,25 @@ impl Mem {
                 return None;
             }
             Some(buf)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut data: libc::vm_offset_t = 0;
+            let mut count: libc::mach_msg_type_number_t = 0;
+            // SAFETY: mach_vm_read allocates `count` readable bytes at `data` on success.
+            let kr =
+                unsafe { mach_vm_read_ffi(self.task, addr, size as u64, &mut data, &mut count) };
+            if kr != 0 {
+                return None;
+            }
+            // SAFETY: mach handed us `count` valid bytes at `data`; copy out then free.
+            let out = unsafe {
+                let slice = std::slice::from_raw_parts(data as *const u8, count as usize);
+                let v = slice.to_vec();
+                libc::vm_deallocate(self_mach_task(), data, count as usize);
+                v
+            };
+            Some(out)
         }
         #[cfg(windows)]
         {
@@ -129,6 +165,25 @@ impl Mem {
     }
 }
 
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    #[link_name = "task_for_pid"]
+    fn task_for_pid_ffi(
+        target: libc::mach_port_t,
+        pid: libc::pid_t,
+        task: *mut libc::mach_port_t,
+    ) -> libc::kern_return_t;
+
+    #[link_name = "mach_vm_read"]
+    fn mach_vm_read_ffi(
+        target: libc::mach_port_t,
+        address: u64,
+        size: u64,
+        data: *mut libc::vm_offset_t,
+        data_count: *mut libc::mach_msg_type_number_t,
+    ) -> libc::kern_return_t;
+}
+
 #[cfg(windows)]
 impl Drop for Mem {
     fn drop(&mut self) {
@@ -137,6 +192,33 @@ impl Drop for Mem {
             windows_sys::Win32::Foundation::CloseHandle(self.handle);
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Mem {
+    fn drop(&mut self) {
+        // SAFETY: release the send right obtained from task_for_pid.
+        unsafe {
+            mach_port_deallocate_ffi(self_mach_task(), self.task);
+        }
+    }
+}
+
+/// 当前任务的 mach port（`mach_task_self()` 在 libc 中已标记 deprecated）。
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+fn self_mach_task() -> libc::mach_port_t {
+    // SAFETY: reads the cached global self task port.
+    unsafe { libc::mach_task_self() }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    #[link_name = "mach_port_deallocate"]
+    fn mach_port_deallocate_ffi(
+        task: libc::mach_port_t,
+        name: libc::mach_port_t,
+    ) -> libc::kern_return_t;
 }
 
 fn read_u64(mem: &Mem, addr: u64) -> Option<u64> {
@@ -213,6 +295,7 @@ fn find_qwords(
     find_pattern(mem, regions, &value.to_le_bytes(), 8, pred, limit)
 }
 
+#[cfg(windows)]
 fn find_dwords(
     mem: &Mem,
     regions: &[Region],
@@ -256,7 +339,7 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 /// 枚举 Linux `/proc/<pid>/maps`。
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn parse_maps(pid: u32) -> Vec<Region> {
     let txt = fs::read_to_string(format!("/proc/{pid}/maps")).unwrap_or_default();
     let mut out = Vec::new();
@@ -284,6 +367,106 @@ fn parse_maps(pid: u32) -> Vec<Region> {
             off,
             path,
         });
+    }
+    out
+}
+
+/// 枚举 macOS 虚拟内存区间（`proc_pidinfo` + `proc_regionfilename`），
+/// 并标注 `wrapper.node` 模块区间。无需 `task_for_pid`。
+#[cfg(target_os = "macos")]
+fn parse_maps(pid: u32) -> Vec<Region> {
+    const PROC_PIDREGIONINFO: libc::c_int = 7;
+    const VM_PROT_READ: u32 = 0x1;
+    const VM_PROT_WRITE: u32 = 0x2;
+    const VM_PROT_EXECUTE: u32 = 0x4;
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ProcRegionInfo {
+        pri_protection: u32,
+        pri_max_protection: u32,
+        pri_inheritance: u32,
+        pri_flags: u32,
+        pri_offset: u64,
+        pri_behavior: u32,
+        pri_user_wired_count: u32,
+        pri_user_tag: u32,
+        pri_pages_resident: u32,
+        pri_pages_shared_now_private: u32,
+        pri_pages_swapped_out: u32,
+        pri_pages_dirtied: u32,
+        pri_ref_count: u32,
+        pri_shadow_depth: u32,
+        pri_share_mode: u32,
+        pri_private_pages_resident: u32,
+        pri_shared_pages_resident: u32,
+        pri_obj_id: u32,
+        pri_depth: u32,
+        pri_address: u64,
+        pri_size: u64,
+    }
+    const _: () = assert!(size_of::<ProcRegionInfo>() == 96);
+
+    let mut out = Vec::new();
+    let mut addr: u64 = 0;
+    for _ in 0..2_000_000 {
+        // SAFETY: proc_pidinfo fills a correctly-sized ProcRegionInfo or returns <= 0.
+        let mut info: ProcRegionInfo = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                PROC_PIDREGIONINFO,
+                addr,
+                &mut info as *mut _ as *mut libc::c_void,
+                size_of::<ProcRegionInfo>() as libc::c_int,
+            )
+        };
+        if rc <= 0 || info.pri_size == 0 {
+            break;
+        }
+        let prot = info.pri_protection;
+        if prot & VM_PROT_READ != 0 {
+            let mut path = [0u8; 4096];
+            // SAFETY: writes a NUL-terminated path (or nothing) into the buffer.
+            let plen = unsafe {
+                libc::proc_regionfilename(
+                    pid as libc::c_int,
+                    info.pri_address,
+                    path.as_mut_ptr() as *mut libc::c_void,
+                    path.len() as u32,
+                )
+            };
+            let path_s = if plen > 0 {
+                let end = path.iter().position(|&b| b == 0).unwrap_or(plen as usize);
+                String::from_utf8_lossy(&path[..end]).into_owned()
+            } else {
+                String::new()
+            };
+            // share_mode: 1=COW,2=PRIVATE,3=EMPTY,6=PRIVATE_ALIASED,8=LARGE_PAGE
+            // 视为「私有」；4=SHARED,5=TRUESHARED,7=SHARED_ALIASED 视为共享。
+            let private = !matches!(info.pri_share_mode, 4 | 5 | 7);
+            let perms = format!(
+                "r{}{}{}",
+                if prot & VM_PROT_WRITE != 0 { 'w' } else { '-' },
+                if prot & VM_PROT_EXECUTE != 0 {
+                    'x'
+                } else {
+                    '-'
+                },
+                if private { 'p' } else { 's' },
+            );
+            out.push(Region {
+                start: info.pri_address,
+                end: info.pri_address + info.pri_size,
+                perms,
+                off: info.pri_offset,
+                path: path_s,
+            });
+        }
+        let next = info.pri_address.saturating_add(info.pri_size);
+        if next <= addr {
+            break;
+        }
+        addr = next;
     }
     out
 }
@@ -414,8 +597,8 @@ fn is_mod(r: &Region) -> bool {
     r.path.contains("wrapper.node")
 }
 
-/// 找到 typeinfo 名字在内存中的地址（Linux：磁盘 ELF；Windows：直接内存搜）。
-#[cfg(not(windows))]
+/// 找到 typeinfo 名字在内存中的地址（Linux：磁盘 ELF；Windows 直接内存搜）。
+#[cfg(target_os = "linux")]
 fn find_typeinfo_name(mem: &Mem, regions: &[Region], _base: u64) -> Option<u64> {
     let mods: Vec<Region> = regions.iter().filter(|r| is_mod(r)).cloned().collect();
     let mod_path = mods.first()?.path.clone();
@@ -455,12 +638,65 @@ fn find_typeinfo_name(mem: &Mem, regions: &[Region], _base: u64) -> Option<u64> 
         .next()
 }
 
+/// macOS：Mach-O 里字符串常量与 Linux 的 ELF 一样是连续的 mangled 名。
+/// 取「前一字节为 NUL（或区间首）」的首次命中作为真正的类型名。
+#[cfg(target_os = "macos")]
+fn find_typeinfo_name(mem: &Mem, regions: &[Region], _base: u64) -> Option<u64> {
+    let pred = |r: &Region| is_mod(r) && r.perms.contains('r');
+    for r in regions.iter().filter(|r| pred(r)) {
+        let mut pos = r.start;
+        while pos < r.end {
+            let want = std::cmp::min(CHUNK as u64, r.end - pos) as usize;
+            if let Some(data) = mem.read(pos, want) {
+                let mut i = 0usize;
+                while i + TYPEINFO_NAME.len() <= data.len() {
+                    if data[i..i + TYPEINFO_NAME.len()] == *TYPEINFO_NAME {
+                        let prev_ok = if i == 0 {
+                            pos == r.start
+                        } else {
+                            data[i - 1] == 0
+                        };
+                        if prev_ok {
+                            return Some(pos + i as u64);
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            pos += want as u64;
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn open_mem_error(pid: u32) -> String {
+    format!(
+        "无法打开 pid {pid} 的内存（OpenProcess 失败）。请在管理员终端运行，并确认 QQ 未提权/未受保护。"
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn open_mem_error(pid: u32) -> String {
+    format!(
+        "无法打开 pid {pid} 的内存（process_vm_readv 失败）。请用 root 运行（或授予 CAP_SYS_PTRACE），\
+         并检查 /proc/sys/kernel/yama/ptrace_scope 是否放行。"
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn open_mem_error(pid: u32) -> String {
+    format!(
+        "无法打开 pid {pid} 的内存（task_for_pid 失败）。macOS 需满足：\n\
+         1) 以 root 运行：`sudo ./qqshark scan`；\n\
+         2) **关闭 SIP**：目标启用了强化运行时（hardened runtime，QQ 即如此），即便 root 也会被\n\
+            taskgated 拒绝（kern_return=5）。关闭方式：重启进恢复模式执行 `csrutil disable` 后重启；\n\
+         3) 若只是想抓包（capture），无需关闭 SIP，sudo 即可。"
+    )
+}
+
 pub fn scan(pid: u32) -> anyhow::Result<SessionInfo> {
-    let mem = Mem::open(pid).ok_or_else(|| {
-        anyhow::anyhow!(
-            "无法打开 pid {pid} 的内存（OpenProcess 失败）。请以管理员身份运行，并确认 QQ 未提权/未受保护。"
-        )
-    })?;
+    let mem = Mem::open(pid).ok_or_else(|| anyhow::anyhow!("{}", open_mem_error(pid)))?;
     let regions = parse_maps(pid);
 
     let base = module_base(&regions)
@@ -469,6 +705,7 @@ pub fn scan(pid: u32) -> anyhow::Result<SessionInfo> {
     let name_rt = find_typeinfo_name(&mem, &regions, base).ok_or_else(|| {
         anyhow::anyhow!("在 wrapper.node 中未找到 typeinfo 名（客户端版本可能已变）")
     })?;
+    #[cfg_attr(not(windows), allow(unused_variables))]
     let name_rva = name_rt - base;
 
     let is_mod_data = |r: &Region| is_mod(r) && r.perms.contains('r') && !r.perms.contains('x');

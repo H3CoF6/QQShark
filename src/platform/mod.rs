@@ -1,8 +1,8 @@
 //! 平台抽象：QQ 主进程枚举、权限检测、数据库占用（锁）探测。
 //!
 //! 移植自 `../x_key_scanner`，去掉其内存读取 trait（qqshark 的 `scan.rs` 已自带
-//! 跨平台实现：Linux 用 process_vm_readv，Windows 用 ReadProcessMemory），
-//! 只保留与 pid→UIN 映射相关的能力。
+//! 跨平台实现：Linux 用 process_vm_readv，Windows 用 ReadProcessMemory，
+//! macOS 用 task_for_pid + mach_vm_read），只保留与 pid→UIN 映射相关的能力。
 
 #[cfg(windows)]
 mod windows;
@@ -99,5 +99,43 @@ pub fn comm_of(pid: u32) -> Option<String> {
     #[cfg(windows)]
     {
         windows::comm_of(pid)
+    }
+}
+
+/// 默认路由出口的接口名（Linux/macOS）。
+///
+/// * Linux：解析 `/proc/net/route`，取 Destination=0.0.0.0 且 metric 最小者。
+/// * macOS：解析 `/sbin/route -n get default` 的 `interface:` 行。
+#[cfg(not(windows))]
+pub fn default_route_iface() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let txt = std::fs::read_to_string("/proc/net/route").ok()?;
+        let mut best: Option<(u32, String)> = None;
+        for line in txt.lines().skip(1) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 8 || f[1] != "00000000" {
+                continue;
+            }
+            let metric: u32 = f[6].parse().unwrap_or(u32::MAX);
+            if best.as_ref().is_none_or(|(m, _)| metric < *m) {
+                best = Some((metric, f[0].to_string()));
+            }
+        }
+        best.map(|(_, name)| name)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("/sbin/route")
+            .args(["-n", "get", "default"])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix("interface:")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
     }
 }

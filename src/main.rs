@@ -90,12 +90,12 @@ struct ProcsArgs {
 
 #[derive(clap::Args)]
 struct CapArgs {
-    /// 抓包接口：`auto` 自动选默认出口网卡；Linux 也可用 "Meta"/"any"/"wlan0"/"eth0"；
-    /// Windows 也可用 Npcap 设备名（形如 \Device\NPF_{GUID} 或网卡描述）
+    /// 抓包接口：`auto`（默认）自动选默认出口网卡；也可填 en0/wlan0/eth0 等，
+    /// Linux 或 TUN 场景可填 "any"/"Meta"；Windows 填 Npcap 设备名
     #[arg(short, long, default_value = DEFAULT_IFACE)]
     iface: String,
-    /// MSF 服务端口
-    #[arg(short, long, default_value_t = 14000)]
+    /// MSF 服务端口；`auto`/`0` = 按流量自动识别
+    #[arg(short, long, default_value_t = default_msf_port(), value_parser = parse_port)]
     port: u16,
     /// d2key (32 字符 hex)；省略则用 --pid 自动扫描
     #[arg(long)]
@@ -122,11 +122,12 @@ struct CapArgs {
 
 #[derive(clap::Args)]
 struct LiveArgs {
-    /// 抓包接口：`auto` 自动选默认出口网卡；Linux 也可用 "Meta"/"any"/"wlan0"/"eth0"；
-    /// Windows 也可用 Npcap 设备名（形如 \Device\NPF_{GUID} 或网卡描述）
+    /// 抓包接口：`auto`（默认）自动选默认出口网卡；也可填 en0/wlan0/eth0 等，
+    /// Linux 或 TUN 场景可填 "any"/"Meta"；Windows 填 Npcap 设备名
     #[arg(short, long, default_value = DEFAULT_IFACE)]
     iface: String,
-    #[arg(short, long, default_value_t = 14000)]
+    /// MSF 服务端口；`auto`/`0` = 按流量自动识别
+    #[arg(short, long, default_value_t = default_msf_port(), value_parser = parse_port)]
     port: u16,
     /// 直接指定 pid（跳过交互选择）
     #[arg(long)]
@@ -143,11 +144,30 @@ struct LiveArgs {
     count: Option<usize>,
 }
 
-/// 默认抓包接口：Windows 自动选默认出口网卡，其余平台沿用 Linux 的 "Meta"。
-#[cfg(windows)]
+/// 端口解析：`auto`/`0` → 0（运行时按流量自动识别），否则普通 u16。
+fn parse_port(v: &str) -> Result<u16, String> {
+    if v.eq_ignore_ascii_case("auto") {
+        return Ok(0);
+    }
+    v.parse::<u16>()
+        .map_err(|_| format!("无效端口 '{v}'（应为 0..=65535 或 auto）"))
+}
+
+/// 默认抓包接口：各平台统一 `auto`（自动选默认出口网卡）。
 const DEFAULT_IFACE: &str = "auto";
-#[cfg(not(windows))]
-const DEFAULT_IFACE: &str = "Meta";
+
+/// MSF 服务端口默认值：Windows 走 443，Linux/macOS 走 14000。
+/// 也可用 `--port auto`（或 `0`）在运行时按流量自动识别。
+const fn default_msf_port() -> u16 {
+    #[cfg(windows)]
+    {
+        443
+    }
+    #[cfg(not(windows))]
+    {
+        14000
+    }
+}
 fn hex16(s: &str) -> anyhow::Result<[u8; 16]> {
     let s = s.trim();
     let b = s.as_bytes();
@@ -434,7 +454,15 @@ fn resolve_d2key(explicit: Option<&str>, pid: Option<u32>) -> anyhow::Result<Opt
         return Ok(Some(hex16(s)?));
     }
     let Some(pid) = pid else { return Ok(None) };
-    let info = scan::scan(pid)?;
+    // 扫描失败（如 macOS 未关 SIP、权限不足）不应中断抓包——无 d2key 也能看
+    // 帧结构，只是不解密正文。
+    let info = match scan::scan(pid) {
+        Ok(info) => info,
+        Err(e) => {
+            ui::warn(&format!("自动扫描 d2key 失败，继续抓包（不解密）：{e:#}"));
+            return Ok(None);
+        }
+    };
     match &info.d2key {
         Some(k) if k.len() == 16 => {
             ui::ok(&format!("自动扫描到 d2key = {}", info.d2key_hex));

@@ -401,7 +401,7 @@ impl PcapWriter {
 
 /// 权限相关错误的中文提示。
 fn open_error_hint(iface: &str, e: &str) -> String {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         format!(
             "无法在接口 '{iface}' 上开启抓包：{e}\n\
@@ -411,6 +411,18 @@ fn open_error_hint(iface: &str, e: &str) -> String {
                 `sudo setcap cap_net_raw,cap_net_admin+eip $(readlink -f ./qqshark)`\n\
              3) 若使用 Clash/Meta TUN：QQ 流量会出现在 `Meta` 接口上，用 `-i Meta`；\n\
                 否则用物理网卡（`-i any` / `-i wlan0` / `-i eth0`）即可，无需 TUN。"
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        format!(
+            "无法在接口 '{iface}' 上开启抓包：{e}\n\
+             → macOS 的 BPF 设备（/dev/bpf*）默认仅 root 可读，请用 sudo 重跑：\n\
+             1) `sudo ./qqshark capture -i {iface}`（内存扫描也需 sudo）。\n\
+             2) 想免 sudo：安装 Wireshark 的 “ChmodBPF” 并把自己加入 `access_bpf` 组，\n\
+                或 `sudo chown $USER /dev/bpf*`（重启后失效）。\n\
+             3) 接口名用 `en0`（Wi-Fi/有线）或 `lo0`（回环）；若走代理 TUN，流量可能在\n\
+                `utun*` 上——仍建议直接抓物理网卡（en0）上的 TCP 14000 流量，无需 TUN。"
         )
     }
     #[cfg(windows)]
@@ -429,7 +441,7 @@ fn open_error_hint(iface: &str, e: &str) -> String {
              4) 若只列出“回环适配器”：重装 Npcap 并勾选安装到所有网卡\n\
                 （含 “Support loopback traffic capture”），或改选物理网卡；\n\
              5) 若走代理/TUN（Clash 等），选对应虚拟网卡，或直接抓物理卡的\n\
-                TCP 14000 流量即可（无需 TUN）。"
+                TCP 443 流量即可（无需 TUN）。"
         )
     }
 }
@@ -437,7 +449,18 @@ fn open_error_hint(iface: &str, e: &str) -> String {
 /// 检查是否具备抓包权限，给出可读诊断。
 pub fn check_capture_privileges(iface: &str) -> bool {
     let elevated = crate::platform::is_elevated();
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
+    {
+        if elevated {
+            return true;
+        }
+        crate::ui::warn(&format!(
+            "当前没有 root 权限，接口 '{iface}' 的 BPF 抓包会失败（/dev/bpf* 仅 root 可读）。\
+             请用 `sudo ./qqshark capture -i {iface}` 重跑；若想免 sudo 可安装 Wireshark 的 ChmodBPF。"
+        ));
+        false
+    }
+    #[cfg(target_os = "linux")]
     {
         let has_cap = std::fs::read_to_string("/proc/self/status")
             .map(|s| {
@@ -497,6 +520,9 @@ fn device_matches(d: &pcap::Device, iface: &str) -> bool {
 /// 自动挑选抓包设备：优先默认路由出口网卡，其次第一个非回环设备。
 fn pick_auto_device(list: &[pcap::Device]) -> Option<usize> {
     let is_loopback = |d: &pcap::Device| {
+        if d.flags.is_loopback() {
+            return true;
+        }
         let name = d.name.to_ascii_lowercase();
         let desc = d.desc.as_deref().unwrap_or("").to_ascii_lowercase();
         name.contains("loopback") || desc.contains("loopback")
@@ -517,6 +543,18 @@ fn pick_auto_device(list: &[pcap::Device]) -> Option<usize> {
             }) {
                 return Some(i);
             }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        // 默认路由出口网卡（Linux: /proc/net/route；macOS: route get default）。
+        if let Some(iface) = crate::platform::default_route_iface()
+            && let Some(i) = list
+                .iter()
+                .position(|d| d.name.eq_ignore_ascii_case(&iface))
+        {
+            return Some(i);
         }
     }
 
@@ -624,6 +662,43 @@ fn emit_frame(opts: &CaptureOpts, v: &FrameView<'_>) {
     ui::packet_box(direction, &segments, &body, 60);
 }
 
+/// MSF 帧签名检测：在 TCP 负载里寻找 `[4B total][4B proto(12|13)][1B encryptType]`。
+/// 用于 `--port auto` 时的动态端口识别（total 需合理、encryptType ∈ {0,1}）。
+fn looks_like_msf(payload: &[u8]) -> bool {
+    if payload.len() < 9 {
+        return false;
+    }
+    for i in 0..=payload.len() - 9 {
+        let proto = u32::from_be_bytes([
+            payload[i + 4],
+            payload[i + 5],
+            payload[i + 6],
+            payload[i + 7],
+        ]);
+        if proto != frame::PROTO_D2AUTH && proto != frame::PROTO_SIMPLE {
+            continue;
+        }
+        let total =
+            u32::from_be_bytes([payload[i], payload[i + 1], payload[i + 2], payload[i + 3]]);
+        if (16..=1_000_000).contains(&total) && payload[i + 8] <= 1 {
+            return true;
+        }
+    }
+    false
+}
+
+/// 从观测到的端口投票里挑 MSF 服务端口：优先非临时端口（<32768，排除客户端
+/// 临时端口），再看出现次数；至少需 3 票以避免误判。
+fn pick_msf_port(votes: &HashMap<u16, u32>) -> Option<u16> {
+    let mut cands: Vec<(u16, u32)> = votes.iter().map(|(p, v)| (*p, *v)).collect();
+    cands.sort_by(|a, b| {
+        let ae = a.0 >= 32768;
+        let be = b.0 >= 32768;
+        ae.cmp(&be).then(b.1.cmp(&a.1)).then(a.0.cmp(&b.0))
+    });
+    cands.into_iter().find(|(_, v)| *v >= 3).map(|(p, _)| p)
+}
+
 pub fn run(opts: CaptureOpts) -> anyhow::Result<()> {
     install_interrupt_handler();
     let _guard = RawGuard::new();
@@ -673,7 +748,14 @@ pub fn run(opts: CaptureOpts) -> anyhow::Result<()> {
         .open()
         .map_err(|e| anyhow::anyhow!(open_error_hint(&device_label, &e.to_string())))?;
 
-    let filter = format!("tcp port {}", opts.port);
+    // 端口：0 表示自动识别（先用宽过滤 "tcp"，识别后再收敛）。
+    let mut port = opts.port;
+    let auto_port = port == 0;
+    let filter = if auto_port {
+        "tcp".to_string()
+    } else {
+        format!("tcp port {port}")
+    };
     cap.filter(&filter, true)
         .with_context(|| format!("set filter '{filter}'"))?;
     let linktype = cap.get_datalink();
@@ -682,6 +764,14 @@ pub fn run(opts: CaptureOpts) -> anyhow::Result<()> {
     ui::section("抓包");
     ui::field("接口", &device_label);
     ui::field("过滤", &filter);
+    ui::field(
+        "端口",
+        &if auto_port {
+            "auto（按流量识别）".to_string()
+        } else {
+            port.to_string()
+        },
+    );
     ui::field("链路层", &format!("linktype={lt} (l2={l2})"));
     ui::field(
         "d2key",
@@ -703,6 +793,8 @@ pub fn run(opts: CaptureOpts) -> anyhow::Result<()> {
     let mut flows: HashMap<FlowKey, Flow> = HashMap::new();
     let mut emitted = 0usize;
     let mut pkt_no = 0usize;
+    let mut port_votes: HashMap<u16, u32> = HashMap::new();
+    let mut pending_refilter = false;
 
     loop {
         if stop_requested() {
@@ -738,7 +830,22 @@ pub fn run(opts: CaptureOpts) -> anyhow::Result<()> {
         let Some(tcp) = parse_tcp(l4) else { continue };
         let payload = &l4[tcp.payload_off..];
 
-        let (key, is_c2s) = if tcp.dport == opts.port {
+        // 自动端口：先从 MSF 帧签名投票，命中后收敛过滤并锁定端口。
+        if port == 0 {
+            if looks_like_msf(payload) {
+                *port_votes.entry(tcp.dport).or_default() += 1;
+                *port_votes.entry(tcp.sport).or_default() += 1;
+                if let Some(p) = pick_msf_port(&port_votes) {
+                    port = p;
+                    pending_refilter = true;
+                }
+            }
+            if port == 0 {
+                continue;
+            }
+        }
+
+        let (key, is_c2s) = if tcp.dport == port {
             (
                 FlowKey {
                     client: (src, tcp.sport),
@@ -746,7 +853,7 @@ pub fn run(opts: CaptureOpts) -> anyhow::Result<()> {
                 },
                 true,
             )
-        } else if tcp.sport == opts.port {
+        } else if tcp.sport == port {
             (
                 FlowKey {
                     client: (dst, tcp.dport),
@@ -799,6 +906,15 @@ pub fn run(opts: CaptureOpts) -> anyhow::Result<()> {
                 return Ok(());
             }
         }
+
+        // 端口识别完成后收敛过滤（此时 packet 借用已结束）。
+        if pending_refilter {
+            pending_refilter = false;
+            let f = format!("tcp port {port}");
+            if cap.filter(&f, true).is_ok() {
+                ui::ok(&format!("自动识别 MSF 端口 = {port}（过滤收敛为 '{f}'）"));
+            }
+        }
     }
     ui::ok(&format!("抓包结束。packets={pkt_no} frames={emitted}"));
     Ok(())
@@ -807,6 +923,29 @@ pub fn run(opts: CaptureOpts) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn msf_signature_detects_frame() {
+        let mut p = 32u32.to_be_bytes().to_vec();
+        p.extend_from_slice(&13u32.to_be_bytes());
+        p.push(1);
+        p.extend_from_slice(&[0u8; 20]);
+        assert!(looks_like_msf(&p));
+        assert!(!looks_like_msf(&[0u8; 40]));
+        assert!(!looks_like_msf(&[1, 2, 3]));
+    }
+
+    #[test]
+    fn msf_port_vote_prefers_service_port() {
+        let mut v: HashMap<u16, u32> = HashMap::new();
+        v.insert(14000, 5);
+        v.insert(51000, 5);
+        assert_eq!(pick_msf_port(&v), Some(14000));
+        // 票数不足时不误判。
+        let mut v2: HashMap<u16, u32> = HashMap::new();
+        v2.insert(14000, 2);
+        assert_eq!(pick_msf_port(&v2), None);
+    }
 
     #[test]
     fn l2_offset_known_linktypes() {
