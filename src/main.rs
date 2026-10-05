@@ -94,9 +94,9 @@ struct CapArgs {
     /// 等（Windows 填 Npcap 设备名）
     #[arg(short, long, default_value = DEFAULT_IFACE)]
     iface: String,
-    /// MSF 服务端口；`auto`（默认）/`0` = 按流量自动识别，也可写 80/443/14000 等
-    #[arg(short, long, default_value = DEFAULT_PORT, value_parser = parse_port)]
-    port: u16,
+    /// MSF 服务端口：`auto`（默认）持续按流量识别（端口中途切换也能接住）；也可写固定端口 `14000`，或用逗号写多个 `14000,443,80`（`auto` 可与固定端口叠加）
+    #[arg(short, long, default_value = DEFAULT_PORT, value_parser = parse_port_spec)]
+    port: capture::PortSpec,
     /// d2key (32 字符 hex)；省略则用 --pid 自动扫描
     #[arg(long)]
     d2key: Option<String>,
@@ -126,9 +126,9 @@ struct LiveArgs {
     /// 等（Windows 填 Npcap 设备名）
     #[arg(short, long, default_value = DEFAULT_IFACE)]
     iface: String,
-    /// MSF 服务端口；`auto`（默认）/`0` = 按流量自动识别，也可写 80/443/14000 等
-    #[arg(short, long, default_value = DEFAULT_PORT, value_parser = parse_port)]
-    port: u16,
+    /// MSF 服务端口：`auto`（默认）持续按流量识别（端口中途切换也能接住）；也可写固定端口 `14000`，或用逗号写多个 `14000,443,80`（`auto` 可与固定端口叠加）
+    #[arg(short, long, default_value = DEFAULT_PORT, value_parser = parse_port_spec)]
+    port: capture::PortSpec,
     /// 直接指定 pid（跳过交互选择）
     #[arg(long)]
     pid: Option<u32>,
@@ -146,13 +146,34 @@ struct LiveArgs {
     count: Option<usize>,
 }
 
-/// 端口解析：`auto`/`0` → 0（运行时按流量自动识别），否则普通 u16。
-fn parse_port(v: &str) -> Result<u16, String> {
-    if v.eq_ignore_ascii_case("auto") {
-        return Ok(0);
+/// 端口解析：`auto`/`0` → 持续自动识别；`14000`（单端口）或 `14000,443,80`
+/// （多端口）→ 固定端口集合。`auto` 可与固定端口叠加，如 `auto,443`：
+/// 既抓 443，又持续识别新端口。
+fn parse_port_spec(v: &str) -> Result<capture::PortSpec, String> {
+    let mut spec = capture::PortSpec::default();
+    for part in v.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if part.eq_ignore_ascii_case("auto") {
+            spec.auto = true;
+            continue;
+        }
+        let p: u16 = part
+            .parse()
+            .map_err(|_| format!("无效端口 '{part}'（应为 0..=65535 / auto，或用逗号分隔多个）"))?;
+        if p == 0 {
+            spec.auto = true;
+        } else if !spec.ports.contains(&p) {
+            spec.ports.push(p);
+        }
     }
-    v.parse::<u16>()
-        .map_err(|_| format!("无效端口 '{v}'（应为 0..=65535 或 auto）"))
+    if spec.ports.is_empty() && !spec.auto {
+        // 空串或全为分隔符时退化为 auto，保持与旧默认一致。
+        spec.auto = true;
+    }
+    Ok(spec)
 }
 
 /// 默认抓包接口：各平台统一 `auto`（自动选默认出口网卡）。
@@ -227,7 +248,8 @@ fn hex_decode_loose(s: &str) -> anyhow::Result<Vec<u8>> {
 
 fn print_indented(lines: &[String]) {
     for line in lines {
-        println!("  {line}");
+        // 展开的 protobuf/JCE 行较长时不换行（换行会破坏对齐），按终端宽度截断。
+        println!("  {}", ui::fit_line_to_terminal(line, 2));
     }
 }
 
@@ -496,7 +518,7 @@ fn cmd_capture(a: CapArgs) -> anyhow::Result<()> {
     }
     capture::run(capture::CaptureOpts {
         iface: a.iface,
-        port: a.port,
+        ports: a.port,
         d2key,
         write: a.write,
         hex: !a.only_head,
@@ -552,7 +574,7 @@ fn cmd_live(a: LiveArgs) -> anyhow::Result<()> {
     ui::section("第三步 · 抓包");
     capture::run(capture::CaptureOpts {
         iface: a.iface,
-        port: a.port,
+        ports: a.port,
         d2key,
         write: a.write,
         hex: !a.only_head,
@@ -621,5 +643,39 @@ mod tests {
     fn hex16_rejects_bad_length_and_chars() {
         assert!(hex16("abcd").is_err());
         assert!(hex16(&"z".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn port_spec_auto_variants() {
+        assert_eq!(parse_port_spec("auto").unwrap(), capture::PortSpec::auto());
+        assert_eq!(parse_port_spec("0").unwrap(), capture::PortSpec::auto());
+        assert_eq!(parse_port_spec("").unwrap(), capture::PortSpec::auto());
+    }
+
+    #[test]
+    fn port_spec_single_and_multi() {
+        assert_eq!(
+            parse_port_spec("14000").unwrap(),
+            capture::PortSpec::fixed(14000)
+        );
+        let multi = parse_port_spec("14000,443,80").unwrap();
+        assert!(!multi.auto);
+        assert_eq!(multi.ports, vec![14000, 443, 80]);
+        // 去重
+        let dup = parse_port_spec("80,80,443").unwrap();
+        assert_eq!(dup.ports, vec![80, 443]);
+    }
+
+    #[test]
+    fn port_spec_auto_with_fixed_ports() {
+        let mixed = parse_port_spec("auto,443").unwrap();
+        assert!(mixed.auto);
+        assert_eq!(mixed.ports, vec![443]);
+    }
+
+    #[test]
+    fn port_spec_rejects_bad_input() {
+        assert!(parse_port_spec("70000").is_err());
+        assert!(parse_port_spec("http").is_err());
     }
 }

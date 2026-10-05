@@ -299,16 +299,115 @@ fn pad_to(s: &str, cols: usize) -> String {
     }
 }
 
+/// 探测终端可见列数（stdout 非 TTY 时返回 None，此时不做宽度限制）。
+#[cfg(unix)]
+fn terminal_width() -> Option<usize> {
+    // SAFETY: TIOCGWINSZ fills a properly sized winsize struct, or fails.
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+            Some(ws.ws_col as usize)
+        } else {
+            None
+        }
+    }
+}
+
+/// Windows：从控制台窗口缓冲区信息里取可见宽度。
+#[cfg(windows)]
+fn terminal_width() -> Option<usize> {
+    use windows_sys::Win32::System::Console::{
+        CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetStdHandle, STD_OUTPUT_HANDLE,
+    };
+    // SAFETY: queries the stdout console screen buffer info.
+    unsafe {
+        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+        if GetConsoleScreenBufferInfo(handle, &mut info) != 0 {
+            let w = (info.srWindow.Right - info.srWindow.Left + 1) as usize;
+            (w > 0).then_some(w)
+        } else {
+            None
+        }
+    }
+}
+
+/// 按可见宽度把一行截断到 `max_cols` 以内（ANSI 转义不计宽）。发生截断时在末尾
+/// 加 `…` 并重置颜色，避免样式串到框线上。宁可截断也不换行。
+fn truncate_visible(s: &str, max_cols: usize) -> String {
+    if display_width(s) <= max_cols {
+        return s.to_string();
+    }
+    // 预留 1 列给省略号。
+    let limit = max_cols.saturating_sub(1);
+    let mut out = String::new();
+    let mut width = 0usize;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            out.push(c);
+            if chars.peek() == Some(&'[') {
+                out.push(chars.next().unwrap());
+                for e in chars.by_ref() {
+                    out.push(e);
+                    if ('\u{40}'..='\u{7e}').contains(&e) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        let w = char_width(c);
+        if width + w > limit {
+            break;
+        }
+        out.push(c);
+        width += w;
+    }
+    out.push_str("\u{1b}[0m");
+    out.push('…');
+    out
+}
+
+/// 供方框之外的普通行输出使用：按当前终端宽度截断一行，并把内嵌换行转义掉。
+/// 终端宽度未知（非 TTY）时不做限制。
+pub fn fit_line_to_terminal(s: &str, indent: usize) -> String {
+    let sanitized = s.replace('\r', "\\r").replace('\n', "\\n");
+    match terminal_width() {
+        Some(w) => truncate_visible(&sanitized, w.saturating_sub(indent)),
+        None => sanitized,
+    }
+}
+
 /// 方框渲染：正文可含 ANSI 颜色，宽度按可见字符计算（`display_width` 会跳过转义序列）。
 /// 顶部 header 段用 ` · ` 连接。
 pub fn render_box(dir: Dir, segments: &[String], body: &[String], min_width: usize) -> String {
+    render_box_bounded(dir, segments, body, min_width, terminal_width())
+}
+
+/// `render_box` 的实现体，额外接受一个显式宽度上限（`None` = 不限宽，便于测试）。
+fn render_box_bounded(
+    dir: Dir,
+    segments: &[String],
+    body: &[String],
+    min_width: usize,
+    max_width: Option<usize>,
+) -> String {
     let head = format!("{} {} {}", dir.arrow(), dir.label(), segments.join(" · "));
     let head_w = display_width(&head);
+    // 内容区可用上限：每行总宽 = content_w + 4（`│ ` + 内容 + ` │`），必须 ≤ 终端宽度。
+    let cap = max_width.map(|w| w.saturating_sub(4)).filter(|&w| w > 0);
     // 内容区宽度：必须 ≥ 最长正文行（否则 pad_to 填不下会溢出、右边框右移），
-    // 也 ≥ 头部宽度 + 1（`head` 后跟一个空格），再取 min_width。
+    // 也 ≥ 头部宽度 + 1（`head` 后跟一个空格），再取 min_width；最后按终端宽度封顶。
     let max_body = body.iter().map(|l| display_width(l)).max().unwrap_or(0);
-    let content_w = max_body.max(head_w + 1).max(min_width);
+    let mut content_w = max_body.max(head_w + 1).max(min_width);
+    if let Some(c) = cap {
+        content_w = content_w.min(c);
+    }
     // 上边框：`┌ <head> ────┐`，各行总宽 = head_w + dashes + 4 = content_w + 4。
+    // 头部若超过内容区宽度（终端很窄时），同样按可见宽度截断，保证各行等宽。
+    let head = truncate_visible(&head, content_w);
+    let head_w = display_width(&head);
     let dashes = content_w.saturating_sub(head_w);
     let mut out = String::new();
     out.push('┌');
@@ -320,8 +419,14 @@ pub fn render_box(dir: Dir, segments: &[String], body: &[String], min_width: usi
     out.push('\n');
 
     for line in body {
+        // 先把可能存在的原始换行转义掉，避免内嵌换行把方框冲断。
+        let sanitized = line.replace('\r', "\\r").replace('\n', "\\n");
+        let fitted = match cap {
+            Some(c) => truncate_visible(&sanitized, c),
+            None => sanitized,
+        };
         out.push_str("│ ");
-        out.push_str(&pad_to(line, content_w));
+        out.push_str(&pad_to(&fitted, content_w));
         out.push_str(" │\n");
     }
     out.push('└');
@@ -453,6 +558,70 @@ mod tests {
             ""
         );
         assert_eq!(display_width(plain), display_width(&painted));
+    }
+
+    #[test]
+    fn truncate_visible_keeps_ansi_and_adds_ellipsis() {
+        let painted = paint(palette::tag(), &"x".repeat(100));
+        let cut = truncate_visible(&painted, 20);
+        // 可见宽度 == 上限（19 内容 + 1 省略号）。
+        assert_eq!(display_width(&cut), 20);
+        assert!(cut.ends_with('…'));
+        // 颜色起始序列保留，且末尾显式复位，避免样式串到框线。
+        assert!(cut.contains("\u{1b}["));
+        assert!(cut.ends_with("\u{1b}[0m…"));
+    }
+
+    #[test]
+    fn long_body_line_is_truncated_not_wrapped() {
+        // 模拟终端宽度 80：方框总宽不得超过 80，且长行以省略号截断。
+        let long = "a".repeat(500);
+        let b = render_box_bounded(
+            Dir::Tx,
+            &["seq=1".into()],
+            &[long.clone(), "short".into()],
+            0,
+            Some(80),
+        );
+        let lines: Vec<&str> = b.lines().collect();
+        assert!(lines.iter().all(|l| display_width(l) <= 80), "溢出终端宽度");
+        let w = display_width(lines[0]);
+        for l in &lines {
+            assert_eq!(display_width(l), w, "line width mismatch: {l:?}");
+        }
+        assert!(lines.iter().any(|l| l.contains('…')));
+    }
+
+    #[test]
+    fn embedded_newline_does_not_break_box() {
+        // 正文行内嵌换行必须被转义，否则会冲断方框（左右边框数量 == 总行数）。
+        let body = vec!["a\nb\rc".to_string()];
+        let b = render_box_bounded(Dir::Rx, &["seq=1".into()], &body, 0, Some(80));
+        let lines: Vec<&str> = b.lines().collect();
+        assert_eq!(lines.len(), 3); // 上框 + 1 行 + 下框
+        assert!(lines[1].contains("\\n") && lines[1].contains("\\r"));
+        let w = display_width(lines[0]);
+        for l in &lines {
+            assert_eq!(display_width(l), w, "line width mismatch: {l:?}");
+        }
+    }
+
+    #[test]
+    fn narrow_terminal_truncates_header_too() {
+        // 终端极窄时头部也要截断，各行仍需等宽。
+        let b = render_box_bounded(
+            Dir::Tx,
+            &["seq=1".into(), "cmd=A.B".into()],
+            &["x".into()],
+            0,
+            Some(20),
+        );
+        let lines: Vec<&str> = b.lines().collect();
+        let w = display_width(lines[0]);
+        assert!(w <= 20, "方框超过终端宽度: {w}");
+        for l in &lines {
+            assert_eq!(display_width(l), w, "line width mismatch: {l:?}");
+        }
     }
 
     #[test]

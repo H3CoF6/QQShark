@@ -3,7 +3,7 @@
 //!
 //! 结束方式：Ctrl+C（SIGINT）或 ESC 键。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -16,10 +16,60 @@ use crate::frame;
 use crate::tea;
 use crate::ui::{self, Dir};
 
+/// MSF 端口配置。
+///
+/// * `auto = true`：BPF 过滤器始终保持宽松，运行时持续按 MSF 帧签名发现端口，
+///   在端口切换 / 多端口并存时动态纳管，不会锁死在单一端口上。
+/// * `ports`：预置/固定的候选端口集合。可与 `auto` 叠加（既保留固定端口，
+///   又持续发现新端口）；`auto = false` 时退化为只抓这些端口。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PortSpec {
+    pub auto: bool,
+    pub ports: Vec<u16>,
+}
+
+impl PortSpec {
+    /// 纯自动：持续按签名识别，无预置端口。
+    #[cfg(test)]
+    pub fn auto() -> Self {
+        Self {
+            auto: true,
+            ports: Vec::new(),
+        }
+    }
+
+    /// 单端口固定抓取（向后兼容旧 `-p 14000` 语义）。
+    #[cfg(test)]
+    pub fn fixed(port: u16) -> Self {
+        Self {
+            auto: false,
+            ports: vec![port],
+        }
+    }
+
+    /// 是否需要在内核层收紧 BPF 过滤（仅固定端口集合且不自动发现时）。
+    pub fn tight_filter(&self) -> Option<String> {
+        if self.auto {
+            return None;
+        }
+        match self.ports.as_slice() {
+            [] => None,
+            [p] => Some(format!("tcp port {p}")),
+            ps => Some(format!(
+                "tcp port {}",
+                ps.iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CaptureOpts {
     pub iface: String,
-    pub port: u16,
+    pub ports: PortSpec,
     pub d2key: Option<[u8; 16]>,
     pub write: Option<PathBuf>,
     pub hex: bool,
@@ -246,6 +296,8 @@ struct DirBuf {
 struct Flow {
     c2s: DirBuf,
     s2c: DirBuf,
+    /// 最近一次收到该流数据包的秒级时间戳，用于清理陈旧流。
+    last_seen: u32,
 }
 
 fn seq_before(a: u32, b: u32) -> bool {
@@ -663,7 +715,7 @@ fn emit_frame(opts: &CaptureOpts, v: &FrameView<'_>) {
 }
 
 /// MSF 帧签名检测：在 TCP 负载里寻找 `[4B total][4B proto(12|13)][1B encryptType]`。
-/// 用于 `--port auto` 时的动态端口识别（total 需合理、encryptType ∈ {0,1}）。
+/// 用于 `-p auto` 时的动态端口识别（total 需合理、encryptType ∈ {0,1}）。
 fn looks_like_msf(payload: &[u8]) -> bool {
     if payload.len() < 9 {
         return false;
@@ -687,16 +739,29 @@ fn looks_like_msf(payload: &[u8]) -> bool {
     false
 }
 
-/// 从观测到的端口投票里挑 MSF 服务端口：优先非临时端口（<32768，排除客户端
-/// 临时端口），再看出现次数；至少需 3 票以避免误判。
-fn pick_msf_port(votes: &HashMap<u16, u32>) -> Option<u16> {
-    let mut cands: Vec<(u16, u32)> = votes.iter().map(|(p, v)| (*p, *v)).collect();
-    cands.sort_by(|a, b| {
-        let ae = a.0 >= 32768;
-        let be = b.0 >= 32768;
-        ae.cmp(&be).then(b.1.cmp(&a.1)).then(a.0.cmp(&b.0))
-    });
-    cands.into_iter().find(|(_, v)| *v >= 3).map(|(p, _)| p)
+/// 临时端口判定（IANA 动态/私有端口段），用于区分客户端源端口与服务端口。
+fn is_ephemeral(port: u16) -> bool {
+    port >= 32768
+}
+
+/// 在匹配 MSF 签名的包上判断其服务端口：客户端一般从临时端口发起，服务端口
+/// 非临时；两侧都不是临时端口时取较小者兜底。
+fn service_port_of(sport: u16, dport: u16) -> u16 {
+    match (is_ephemeral(sport), is_ephemeral(dport)) {
+        (true, false) => dport,
+        (false, true) => sport,
+        _ => sport.min(dport),
+    }
+}
+
+/// 从单个 TCP 负载持续识别 MSF 服务端口：命中帧签名即返回该包的服务端口。
+/// 每个包都会调用，因此端口切换 / 多端口并发时新端口都能被纳管。
+fn detect_msf_service_port(payload: &[u8], sport: u16, dport: u16) -> Option<u16> {
+    if looks_like_msf(payload) {
+        Some(service_port_of(sport, dport))
+    } else {
+        None
+    }
 }
 
 pub fn run(opts: CaptureOpts) -> anyhow::Result<()> {
@@ -748,14 +813,18 @@ pub fn run(opts: CaptureOpts) -> anyhow::Result<()> {
         .open()
         .map_err(|e| anyhow::anyhow!(open_error_hint(&device_label, &e.to_string())))?;
 
-    // 端口：0 表示自动识别（先用宽过滤 "tcp"，识别后再收敛）。
-    let mut port = opts.port;
-    let auto_port = port == 0;
-    let filter = if auto_port {
-        "tcp".to_string()
-    } else {
-        format!("tcp port {port}")
-    };
+    // 端口：动态端口集合。
+    //
+    // * `auto = true` → BPF 始终保持宽松的 `tcp`（绝不收敛），端口识别在用户态
+    //   持续进行，因此抓包过程中端口切换 / 多端口并存都能被纳管。
+    // * `auto = false` → 只抓给定端口，可安全收紧内核过滤。
+    let mut ports: HashSet<u16> = opts.ports.ports.iter().copied().collect();
+    let auto_port = opts.ports.auto;
+    // 即便 auto，预置端口集合里若已给出候选也一并纳入。
+    let filter = opts
+        .ports
+        .tight_filter()
+        .unwrap_or_else(|| "tcp".to_string());
     cap.filter(&filter, true)
         .with_context(|| format!("set filter '{filter}'"))?;
     let linktype = cap.get_datalink();
@@ -764,14 +833,22 @@ pub fn run(opts: CaptureOpts) -> anyhow::Result<()> {
     ui::section("抓包");
     ui::field("接口", &device_label);
     ui::field("过滤", &filter);
-    ui::field(
-        "端口",
-        &if auto_port {
-            "auto（按流量识别）".to_string()
+    let port_label = {
+        let mut fixed: Vec<String> = ports.iter().map(|p| p.to_string()).collect();
+        fixed.sort();
+        if auto_port {
+            if fixed.is_empty() {
+                "auto（持续按流量识别，支持中途切换端口）".to_string()
+            } else {
+                format!("auto（预置 {}，并持续识别新端口）", fixed.join("/"))
+            }
+        } else if fixed.is_empty() {
+            "auto".to_string()
         } else {
-            port.to_string()
-        },
-    );
+            fixed.join("/")
+        }
+    };
+    ui::field("端口", &port_label);
     ui::field("链路层", &format!("linktype={lt} (l2={l2})"));
     ui::field(
         "d2key",
@@ -793,8 +870,9 @@ pub fn run(opts: CaptureOpts) -> anyhow::Result<()> {
     let mut flows: HashMap<FlowKey, Flow> = HashMap::new();
     let mut emitted = 0usize;
     let mut pkt_no = 0usize;
-    let mut port_votes: HashMap<u16, u32> = HashMap::new();
-    let mut pending_refilter = false;
+    // auto 模式下过滤器宽松，会看到大量无关流；定期清理陈旧流避免内存无界增长。
+    const FLOW_TTL_SECS: u32 = 180;
+    let mut last_sweep = 0u32;
 
     loop {
         if stop_requested() {
@@ -812,6 +890,10 @@ pub fn run(opts: CaptureOpts) -> anyhow::Result<()> {
         pkt_no += 1;
         let sec = packet.header.ts.tv_sec as u32;
         let usec = packet.header.ts.tv_usec as u32;
+        if sec.saturating_sub(last_sweep) >= 30 {
+            last_sweep = sec;
+            flows.retain(|_, f| sec.saturating_sub(f.last_seen) < FLOW_TTL_SECS);
+        }
         if let Some(w) = writer.as_mut() {
             let _ = w.write(sec, usec, packet.data, packet.header.len);
         }
@@ -830,22 +912,44 @@ pub fn run(opts: CaptureOpts) -> anyhow::Result<()> {
         let Some(tcp) = parse_tcp(l4) else { continue };
         let payload = &l4[tcp.payload_off..];
 
-        // 自动端口：先从 MSF 帧签名投票，命中后收敛过滤并锁定端口。
-        if port == 0 {
-            if looks_like_msf(payload) {
-                *port_votes.entry(tcp.dport).or_default() += 1;
-                *port_votes.entry(tcp.sport).or_default() += 1;
-                if let Some(p) = pick_msf_port(&port_votes) {
-                    port = p;
-                    pending_refilter = true;
-                }
-            }
-            if port == 0 {
+        // 持续端口识别：已纳管端口直接重组；auto 下未纳管端口先跑帧签名，
+        // 命中即把服务端口加入集合（端口切换 / 多端口并存都能接住）。
+        let mut known_dport = ports.contains(&tcp.dport);
+        let mut known_sport = ports.contains(&tcp.sport);
+        if !known_dport && !known_sport {
+            if !auto_port {
                 continue;
+            }
+            match detect_msf_service_port(payload, tcp.sport, tcp.dport) {
+                Some(p) => {
+                    let is_new = ports.insert(p);
+                    if is_new && ports.len() == 1 {
+                        ui::ok(&format!(
+                            "自动识别 MSF 端口 = {p}（持续监测，切换端口会自动纳管）"
+                        ));
+                    } else if is_new {
+                        ui::ok(&format!("发现新的 MSF 端口 = {p}（已纳管）"));
+                    }
+                    // 重新判定：让发现该端口的那一包也进入重组，避免预热丢包。
+                    known_dport = ports.contains(&tcp.dport);
+                    known_sport = ports.contains(&tcp.sport);
+                }
+                None => continue,
             }
         }
 
-        let (key, is_c2s) = if tcp.dport == port {
+        // 服务端口的确定：恰好一侧命中集合时即以该侧为服务端口；两侧都命中
+        // （两个端口都在集合内的罕见情形）取较小者，保证同一连接的两个方向
+        // 得到一致的 flow key 与方向。
+        let server_port = if known_dport && known_sport {
+            tcp.sport.min(tcp.dport)
+        } else if known_dport {
+            tcp.dport
+        } else {
+            tcp.sport
+        };
+
+        let (key, is_c2s) = if tcp.dport == server_port {
             (
                 FlowKey {
                     client: (src, tcp.sport),
@@ -853,7 +957,7 @@ pub fn run(opts: CaptureOpts) -> anyhow::Result<()> {
                 },
                 true,
             )
-        } else if tcp.sport == port {
+        } else {
             (
                 FlowKey {
                     client: (dst, tcp.dport),
@@ -861,11 +965,10 @@ pub fn run(opts: CaptureOpts) -> anyhow::Result<()> {
                 },
                 false,
             )
-        } else {
-            continue;
         };
 
         let flow = flows.entry(key.clone()).or_default();
+        flow.last_seen = sec;
         let dir = if is_c2s { &mut flow.c2s } else { &mut flow.s2c };
         feed(dir, tcp.seq, payload);
         let frames = frame::extract_frames(&mut dir.buf);
@@ -907,14 +1010,9 @@ pub fn run(opts: CaptureOpts) -> anyhow::Result<()> {
             }
         }
 
-        // 端口识别完成后收敛过滤（此时 packet 借用已结束）。
-        if pending_refilter {
-            pending_refilter = false;
-            let f = format!("tcp port {port}");
-            if cap.filter(&f, true).is_ok() {
-                ui::ok(&format!("自动识别 MSF 端口 = {port}（过滤收敛为 '{f}'）"));
-            }
-        }
+        // 说明：auto 模式下 BPF 过滤器**永不收敛**，始终保留 `tcp`。端口识别与
+        // 切换全部在用户态完成，这样抓包过程中端口变化（14000 → 80/443 …）
+        // 以及多端口并发都不会漏包。
     }
     ui::ok(&format!("抓包结束。packets={pkt_no} frames={emitted}"));
     Ok(())
@@ -936,15 +1034,50 @@ mod tests {
     }
 
     #[test]
-    fn msf_port_vote_prefers_service_port() {
-        let mut v: HashMap<u16, u32> = HashMap::new();
-        v.insert(14000, 5);
-        v.insert(51000, 5);
-        assert_eq!(pick_msf_port(&v), Some(14000));
-        // 票数不足时不误判。
-        let mut v2: HashMap<u16, u32> = HashMap::new();
-        v2.insert(14000, 2);
-        assert_eq!(pick_msf_port(&v2), None);
+    fn detect_service_port_ignores_client_ephemeral() {
+        let mut p = 32u32.to_be_bytes().to_vec();
+        p.extend_from_slice(&13u32.to_be_bytes());
+        p.push(1);
+        p.extend_from_slice(&[0u8; 20]);
+        // 客户端 51000 → 服务端 14000：应识别出非临时端口 14000。
+        assert_eq!(detect_msf_service_port(&p, 51000, 14000), Some(14000));
+        // 反向（服务端回复）：仍应识别出 14000。
+        assert_eq!(detect_msf_service_port(&p, 14000, 51000), Some(14000));
+        // 非 MSF 负载不识别。
+        assert_eq!(detect_msf_service_port(&[0u8; 40], 51000, 14000), None);
+    }
+
+    #[test]
+    fn detect_service_port_handles_port_switch() {
+        let mut p = 32u32.to_be_bytes().to_vec();
+        p.extend_from_slice(&12u32.to_be_bytes());
+        p.push(0);
+        p.extend_from_slice(&[0u8; 20]);
+        // 同一会话先走 14000，随后切到 443：两次都能识别（端口不断纳管）。
+        assert_eq!(detect_msf_service_port(&p, 52001, 14000), Some(14000));
+        assert_eq!(detect_msf_service_port(&p, 52002, 443), Some(443));
+    }
+
+    #[test]
+    fn port_spec_tight_filter_only_when_fixed() {
+        assert_eq!(PortSpec::auto().tight_filter(), None);
+        assert_eq!(
+            PortSpec::fixed(14000).tight_filter().as_deref(),
+            Some("tcp port 14000")
+        );
+        let multi = PortSpec {
+            auto: false,
+            ports: vec![443, 80, 14000],
+        };
+        assert_eq!(
+            multi.tight_filter().as_deref(),
+            Some("tcp port 443 or 80 or 14000")
+        );
+        let mixed = PortSpec {
+            auto: true,
+            ports: vec![443],
+        };
+        assert_eq!(mixed.tight_filter(), None);
     }
 
     #[test]
