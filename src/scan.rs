@@ -249,20 +249,102 @@ fn read_i64(mem: &Mem, addr: u64) -> Option<i64> {
     (d.len() >= 8).then(|| i64::from_le_bytes(d[0..8].try_into().unwrap()))
 }
 
-/// 读取字符串风格字段。
+/// 读取字符串风格字段（非 Windows）。
 ///
-/// * Windows：`+0` 为长度、`+8` 为数据指针。
-/// * Linux/macOS：`+0` 为数据指针、`+8` 为长度、`+0x10` 为容量/标志。
-fn read_qstring(mem: &Mem, addr: u64) -> Option<Vec<u8>> {
+/// `std::string` 的两种对象布局在盘面上都会出现，且与 CPU 架构相关
+/// （Linux x86_64 与 Intel macOS 是 A 型，Apple Silicon 是 B 型），所以**不能按
+/// 平台猜**，这里按字段实际内容做运行时探测：
+///
+/// * A 型（Linux / Intel macOS）：`+0` 容量、`+8` 长度、`+0x10` 数据指针。
+/// * B 型（Apple Silicon macOS）：`+0` 数据指针、`+8` 长度、`+0x10` 容量/标志。
+///
+/// 两种布局的长度都在 `+8`，只有指针位置不同（`+0` 或 `+0x10`）。指针读数
+/// 失败、长度越界或内容不像 key 字符串时判为无效，从而在两个候选中选出正确的
+/// 一个。
+fn read_qstring(mem: &dyn FieldMem, addr: u64) -> Option<Vec<u8>> {
     #[cfg(windows)]
-    let (sz, ptr) = (read_u64(mem, addr)?, read_u64(mem, addr + 8)?);
+    {
+        // MSVC 布局固定为 `+0` 长度、`+8` 指针。
+        let sz = mem.u64_at(addr)?;
+        let ptr = mem.u64_at(addr + 8)?;
+        return mem.bytes_at(ptr, sz);
+    }
     #[cfg(not(windows))]
-    let (ptr, sz) = (read_u64(mem, addr)?, read_u64(mem, addr + 8)?);
-    if ptr == 0 || sz == 0 || sz > 4096 {
+    {
+        // 长度两种布局一致，都放在 `+8`。
+        let sz = mem.u64_at(addr + 8)?;
+        // 依次探测两种指针位置，取更像 key 字符串的那个。
+        let ptrs = [
+            mem.u64_at(addr + 16)?, // A 型：指针在 +0x10
+            mem.u64_at(addr)?,      // B 型：指针在 +0
+        ];
+        pick_best_field(&ptrs, sz, mem)
+    }
+}
+
+/// `read_qstring` 需要的最小内存访问面；生产实现是 [`Mem`]，测试用假内存。
+trait FieldMem {
+    fn u64_at(&self, addr: u64) -> Option<u64>;
+    /// 读取 `addr` 处恰好 `size` 字节，长度不符返回 `None`。
+    fn bytes_at(&self, addr: u64, size: u64) -> Option<Vec<u8>>;
+}
+
+impl FieldMem for Mem {
+    fn u64_at(&self, addr: u64) -> Option<u64> {
+        read_u64(self, addr)
+    }
+
+    fn bytes_at(&self, addr: u64, size: u64) -> Option<Vec<u8>> {
+        read_exact(self, addr, size)
+    }
+}
+
+/// 从若干候选指针里挑出内容最像密钥字段的那个。
+///
+/// 这是运行时布局探测的核心：两种 `std::string` 布局只有数据指针位置不同，
+/// 因此把两个候选指针都交给它，`mem` 负责按 `(ptr, len)` 取字节，返回值中
+/// "像 key"分值最高者；都读不到则返回 `None`。
+fn pick_best_field(ptrs: &[u64], size: u64, mem: &dyn FieldMem) -> Option<Vec<u8>> {
+    if size == 0 || size > 4096 {
         return None;
     }
-    let data = mem.read(ptr, sz as usize)?;
-    (data.len() >= sz as usize).then_some(data)
+    let mut best: Option<(u32, Vec<u8>)> = None;
+    for &ptr in ptrs {
+        let Some(data) = mem.bytes_at(ptr, size) else {
+            continue;
+        };
+        let score = key_like_score(&data);
+        if best.as_ref().is_none_or(|(b, _)| score > *b) {
+            best = Some((score, data));
+        }
+    }
+    best.map(|(_, d)| d)
+}
+
+/// 读 `ptr` 处恰好 `size` 字节，长度不符视为无效。
+fn read_exact(mem: &Mem, ptr: u64, size: u64) -> Option<Vec<u8>> {
+    if ptr == 0 || size == 0 || size > 4096 {
+        return None;
+    }
+    let data = mem.read(ptr, size as usize)?;
+    (data.len() == size as usize).then_some(data)
+}
+
+/// 给候选原始字节打"像不像密钥字段"的分值。
+///
+/// a2 / d2 / d2key 都是可打印的十六进制 ASCII 串（d2key 为 32 位 hex，解出 16
+/// 字节），故给全 hex ASCII 且偶数长度的最高分，可打印次之，其余最低。分值用于
+/// 在极端情况下两个指针都可读时决出更合理的一个。
+#[cfg_attr(windows, allow(dead_code))]
+fn key_like_score(data: &[u8]) -> u32 {
+    if data.is_empty() {
+        return 0;
+    }
+    if !data.iter().all(|&b| (0x20..0x7f).contains(&b)) {
+        return 1;
+    }
+    let hex = data.len().is_multiple_of(2) && data.iter().all(|&b| b.is_ascii_hexdigit());
+    if hex { 4 } else { 2 }
 }
 
 /// 在满足 pred 的区间里按 `align` 对齐地找 `pat`，返回绝对地址。
@@ -843,24 +925,19 @@ pub fn scan(pid: u32) -> anyhow::Result<SessionInfo> {
         anyhow::bail!("未在堆中找到 SessionForNt 实例");
     }
 
-    // 候选里挑一个密钥字段有效的实例（对象常有多个子对象，先命中的可能字段为空）。
-    let mut chosen: Option<(u64, KeyBytes, Option<Vec<u8>>)> = None;
+    // 候选里挑一个密钥字段最完整的实例（对象常有多个子对象，先命中的可能字段为空）。
+    let mut chosen: Option<(u64, u32, KeyBytes, Option<Vec<u8>>)> = None;
     for &inst in &instances {
         let fields = read_key_fields(&mem, inst);
-        let d2key = fields
-            .2
-            .as_ref()
-            .map(|s| String::from_utf8_lossy(s).trim().to_string())
-            .and_then(|t| hex_decode(&t));
-        let valid = d2key.as_ref().is_some_and(|k| k.len() == 16);
-        if chosen.is_none() || valid {
-            chosen = Some((inst, fields, d2key));
+        let (score, d2key) = score_key_bytes(&fields);
+        if chosen.as_ref().is_none_or(|(_, best, _, _)| score > *best) {
+            chosen = Some((inst, score, fields, d2key));
         }
-        if valid {
+        if score == KEY_BYTES_MAX_SCORE {
             break;
         }
     }
-    let Some((instance, (a2, d2, d2key_raw), d2key)) = chosen else {
+    let Some((instance, _, (a2, d2, d2key_raw), d2key)) = chosen else {
         anyhow::bail!("未找到有效的 SessionForNt 实例");
     };
 
@@ -889,6 +966,32 @@ pub fn scan(pid: u32) -> anyhow::Result<SessionInfo> {
     }
 
     Ok(info)
+}
+
+/// 一组密钥字段的满分：d2key 有效 2 分 + a2 可读 1 分 + d2 可读 1 分。
+const KEY_BYTES_MAX_SCORE: u32 = 4;
+
+/// 给一组 a2/d2/d2key 原始字节打分，并顺带解出 d2key。
+///
+/// d2key 能解出恰好 16 字节记 2 分，a2、d2 各自可读记 1 分。分越高说明这个
+/// 实例越像一个真实、字段齐全的 `SessionForNt`。
+fn score_key_bytes(fields: &KeyBytes) -> (u32, Option<Vec<u8>>) {
+    let d2key = fields
+        .2
+        .as_ref()
+        .map(|s| String::from_utf8_lossy(s).trim().to_string())
+        .and_then(|t| hex_decode(&t));
+    let mut score = 0u32;
+    if d2key.as_ref().is_some_and(|k| k.len() == 16) {
+        score += 2;
+    }
+    if fields.0.is_some() {
+        score += 1;
+    }
+    if fields.1.is_some() {
+        score += 1;
+    }
+    (score, d2key)
 }
 
 /// 读取实例的三个字符串字段：a2 / d2 / d2key（原始字节）。
@@ -957,5 +1060,149 @@ mod tests {
             TYPEINFO_NAME.ends_with(b"SessionForNtE")
                 || TYPEINFO_NAME.ends_with(b"SessionForNt@nt@@")
         );
+    }
+
+    #[test]
+    fn key_like_score_ranks_hex_over_raw() {
+        // 32 位 hex（d2key 的形态）应得最高分。
+        assert_eq!(key_like_score(b"3d2c69392a38707d762c7370654b3a4e"), 4);
+        // 可打印但非 hex。
+        assert_eq!(key_like_score(b"hello world"), 2);
+        // 含不可打印字节。
+        assert_eq!(key_like_score(&[0x00, 0x01, 0x02]), 1);
+        assert_eq!(key_like_score(&[]), 0);
+        // 奇数长度的 hex 串不算 hex。
+        assert_eq!(key_like_score(b"abc"), 2);
+    }
+
+    /// 假内存：`words` 模拟字段对象本体，`blobs` 模拟指针指向的数据。
+    #[derive(Default)]
+    struct FakeMem {
+        words: std::collections::HashMap<u64, u64>,
+        blobs: std::collections::HashMap<u64, Vec<u8>>,
+    }
+
+    impl FakeMem {
+        fn word(mut self, addr: u64, value: u64) -> Self {
+            self.words.insert(addr, value);
+            self
+        }
+        fn blob(mut self, addr: u64, data: &[u8]) -> Self {
+            self.blobs.insert(addr, data.to_vec());
+            self
+        }
+    }
+
+    impl FieldMem for FakeMem {
+        fn u64_at(&self, addr: u64) -> Option<u64> {
+            self.words.get(&addr).copied()
+        }
+        fn bytes_at(&self, addr: u64, size: u64) -> Option<Vec<u8>> {
+            if size == 0 || size > 4096 {
+                return None;
+            }
+            let b = self.blobs.get(&addr)?;
+            (b.len() == size as usize).then(|| b.clone())
+        }
+    }
+
+    // A 型（Linux x64 / Intel macOS）：+0 容量、+8 长度、+0x10 指针。
+    // 回归自 Linux 实测：+0 是小整数容量，真正的指针在 +0x10。
+    #[cfg(not(windows))]
+    #[test]
+    fn probe_picks_pointer_at_plus_16_layout_a() {
+        let obj = 0x1000u64;
+        let data_addr = 0x5_0000u64;
+        let key = b"3d0734cfce071b5b101db5c32eadb53a";
+        let mem = FakeMem::default()
+            .word(obj, 0x91) // +0 容量（会被误当指针的小整数）
+            .word(obj + 8, key.len() as u64) // +8 长度
+            .word(obj + 16, data_addr) // +16 数据指针
+            .blob(data_addr, key);
+        assert_eq!(read_qstring(&mem, obj).as_deref(), Some(&key[..]));
+    }
+
+    // B 型（Apple Silicon）：+0 指针、+8 长度、+0x10 容量/标志（最高位有 0x8000…）。
+    // 回归自你给的 mac ARM heapdump：真正的指针在 +0，+0x10 是无效地址。
+    #[cfg(not(windows))]
+    #[test]
+    fn probe_picks_pointer_at_plus_0_layout_b() {
+        let obj = 0x2000u64;
+        let data_addr = 0x13c0367_9900u64;
+        let key = b"3d2c69392a38707d762c7370654b3a4e";
+        let mem = FakeMem::default()
+            .word(obj, data_addr) // +0 数据指针
+            .word(obj + 8, key.len() as u64) // +8 长度
+            .word(obj + 16, 0x8000_0000_0000_0028) // +16 标志/容量，非法地址
+            .blob(data_addr, key);
+        assert_eq!(read_qstring(&mem, obj).as_deref(), Some(&key[..]));
+    }
+
+    // 两个候选指针都可读时，优先选内容像密钥（全 hex ASCII）的那个。
+    #[cfg(not(windows))]
+    #[test]
+    fn probe_prefers_hex_when_both_readable() {
+        let obj = 0x3000u64;
+        let (len, bad_addr, good_addr) = (16u64, 0x6_0000u64, 0x6_1000u64);
+        let mem = FakeMem::default()
+            .word(obj, bad_addr) // +0 也能读，但不是 hex
+            .word(obj + 8, len)
+            .word(obj + 16, good_addr) // +16 才是真 key
+            .blob(bad_addr, b"randombytes!!!!!")
+            .blob(good_addr, b"3d0734cfce071b5b");
+        assert_eq!(
+            read_qstring(&mem, obj).as_deref(),
+            Some(&b"3d0734cfce071b5b"[..])
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn probe_returns_none_when_no_candidate_readable() {
+        let obj = 0x4000u64;
+        let mem = FakeMem::default()
+            .word(obj, 0x11) // 小整数，不是有效指针
+            .word(obj + 8, 32)
+            .word(obj + 16, 0x8000_0000_0000_0020); // 非法地址
+        assert!(read_qstring(&mem, obj).is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn probe_rejects_oversized_length() {
+        let obj = 0x5000u64;
+        let mem = FakeMem::default()
+            .word(obj, 0x60000)
+            .word(obj + 8, 999_999) // 超过 4096 上限
+            .word(obj + 16, 0x60000)
+            .blob(0x60000, &[0u8; 8]);
+        assert!(read_qstring(&mem, obj).is_none());
+    }
+
+    #[test]
+    fn score_key_bytes_full_marks_for_valid_instance() {
+        let fields = (
+            Some(b"aabbccdd".to_vec()),
+            Some(b"11223344".to_vec()),
+            Some(b"3d2c69392a38707d762c7370654b3a4e".to_vec()), // 32 位 hex -> 16B
+        );
+        let (score, d2key) = score_key_bytes(&fields);
+        assert_eq!(score, KEY_BYTES_MAX_SCORE);
+        assert_eq!(d2key.unwrap().len(), 16);
+    }
+
+    #[test]
+    fn score_key_bytes_empty_instance_scores_zero() {
+        let (score, d2key) = score_key_bytes(&(None, None, None));
+        assert_eq!(score, 0);
+        assert!(d2key.is_none());
+    }
+
+    #[test]
+    fn score_key_bytes_partial_when_d2key_unreadable() {
+        let fields = (Some(b"aabb".to_vec()), None, Some(b"nothex".to_vec()));
+        let (score, d2key) = score_key_bytes(&fields);
+        assert_eq!(score, 1); // 只有 a2 可读
+        assert!(d2key.is_none());
     }
 }
