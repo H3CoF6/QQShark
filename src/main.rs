@@ -94,8 +94,8 @@ struct CapArgs {
     /// Linux 或 TUN 场景可填 "any"/"Meta"；Windows 填 Npcap 设备名
     #[arg(short, long, default_value = DEFAULT_IFACE)]
     iface: String,
-    /// MSF 服务端口；`auto`/`0` = 按流量自动识别
-    #[arg(short, long, default_value_t = default_msf_port(), value_parser = parse_port)]
+    /// MSF 服务端口；`auto`（默认）/`0` = 按流量自动识别，也可写 80/443/14000 等
+    #[arg(short, long, default_value = DEFAULT_PORT, value_parser = parse_port)]
     port: u16,
     /// d2key (32 字符 hex)；省略则用 --pid 自动扫描
     #[arg(long)]
@@ -126,8 +126,8 @@ struct LiveArgs {
     /// Linux 或 TUN 场景可填 "any"/"Meta"；Windows 填 Npcap 设备名
     #[arg(short, long, default_value = DEFAULT_IFACE)]
     iface: String,
-    /// MSF 服务端口；`auto`/`0` = 按流量自动识别
-    #[arg(short, long, default_value_t = default_msf_port(), value_parser = parse_port)]
+    /// MSF 服务端口；`auto`（默认）/`0` = 按流量自动识别，也可写 80/443/14000 等
+    #[arg(short, long, default_value = DEFAULT_PORT, value_parser = parse_port)]
     port: u16,
     /// 直接指定 pid（跳过交互选择）
     #[arg(long)]
@@ -156,18 +156,9 @@ fn parse_port(v: &str) -> Result<u16, String> {
 /// 默认抓包接口：各平台统一 `auto`（自动选默认出口网卡）。
 const DEFAULT_IFACE: &str = "auto";
 
-/// MSF 服务端口默认值：Windows 走 443，Linux/macOS 走 14000。
-/// 也可用 `--port auto`（或 `0`）在运行时按流量自动识别。
-const fn default_msf_port() -> u16 {
-    #[cfg(windows)]
-    {
-        443
-    }
-    #[cfg(not(windows))]
-    {
-        14000
-    }
-}
+/// 默认端口：`auto`。QQ 的 MSF 服务端口由服务器下发，实测会变（见过 80/443/14000），
+/// 所以默认按 MSF 帧签名在运行时自动识别；也可用 `-p <port>` 指定。
+const DEFAULT_PORT: &str = "auto";
 fn hex16(s: &str) -> anyhow::Result<[u8; 16]> {
     let s = s.trim();
     let b = s.as_bytes();

@@ -24,7 +24,7 @@ QQNT 零注入跨平台抓包工具喵～
 
 - 抓包：macOS 的 BPF 设备（`/dev/bpf*`）默认仅 root 可读，用 `sudo` 运行即可，不需要关闭 SIP。默认网卡 `auto` 会自动选默认路由出口（通常是 `en0`）。
 - 内存扫描：QQ 启用了强化运行时（hardened runtime），即使 root，`task_for_pid` 也会被 `taskgated` 拒绝（`kern_return=5`）。只有关闭 SIP 后才可读取：重启进恢复模式执行 `csrutil disable`，再重启。抓包不受此限制。
-- 默认 MSF 端口：macOS/Linux 为 `14000`，Windows 为 `443`；都可用 `-p/--port` 覆盖，或 `-p auto` 按流量自动识别。
+- MSF 端口由服务器下发、**会变**（实测见过 `80`/`443`/`14000`），因此 `-p/--port` 默认 `auto`，按 MSF 帧签名在运行时自动识别；也可显式指定，如 `-p 14000`。
 
 ## 用法
 
