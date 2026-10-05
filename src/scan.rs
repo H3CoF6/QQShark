@@ -31,19 +31,37 @@ const TYPEINFO_NAME: &[u8] = b"N2nt12SessionForNtE";
 #[cfg(windows)]
 const TYPEINFO_NAME: &[u8] = b".?AVSessionForNt@nt@@";
 
-/// SessionForNt 对象里三个密钥字段的相对偏移。
+// SessionForNt 对象里三个密钥字段的相对偏移。
+//
+// | ABI                    | 架构   | a2    | d2    | d2key |
+// | ---------------------- | ------ | ----- | ----- | ----- |
+// | MSVC (Windows)         | x86_64 | 0x158 | 0x170 | 0x188 |
+// | Itanium (Linux/macOS)  | x86_64 | 0x150 | 0x168 | 0x180 |
+// | Itanium (Linux/macOS)  | arm64  | 0x150 | 0x168 | 0x180 |
+//
+// arm64（Linux aarch64 / macOS Apple Silicon）与 x86_64 共用同一 Itanium 布局：
+// 字段均按 8 字节对齐且无架构相关填充，故偏移一致。此处分架构显式列出，
+// 便于日后只需针对单一架构单独校正。
+macro_rules! key_offsets {
+    ($a2:expr, $d2:expr, $d2key:expr) => {
+        const A2_OFF: u64 = $a2;
+        const D2_OFF: u64 = $d2;
+        const D2KEY_OFF: u64 = $d2key;
+    };
+}
+
 #[cfg(windows)]
-const A2_OFF: u64 = 0x158;
-#[cfg(windows)]
-const D2_OFF: u64 = 0x170;
-#[cfg(windows)]
-const D2KEY_OFF: u64 = 0x188;
-#[cfg(not(windows))]
-const A2_OFF: u64 = 0x150;
-#[cfg(not(windows))]
-const D2_OFF: u64 = 0x168;
-#[cfg(not(windows))]
-const D2KEY_OFF: u64 = 0x180;
+key_offsets!(0x158, 0x170, 0x188);
+
+#[cfg(all(not(windows), any(target_arch = "x86_64", target_arch = "aarch64")))]
+key_offsets!(0x150, 0x168, 0x180);
+
+// 兜底：其他架构沿用 Itanium 布局（未实测）。
+#[cfg(all(
+    not(windows),
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+key_offsets!(0x150, 0x168, 0x180);
 
 #[derive(Clone, Debug)]
 struct Region {
@@ -599,7 +617,7 @@ fn is_mod(r: &Region) -> bool {
 
 /// 找到 typeinfo 名字在内存中的地址（Linux：磁盘 ELF；Windows 直接内存搜）。
 #[cfg(target_os = "linux")]
-fn find_typeinfo_name(mem: &Mem, regions: &[Region], _base: u64) -> Option<u64> {
+fn find_typeinfo_name(_mem: &Mem, regions: &[Region], _base: u64) -> Option<u64> {
     let mods: Vec<Region> = regions.iter().filter(|r| is_mod(r)).cloned().collect();
     let mod_path = mods.first()?.path.clone();
     let elf = fs::read(&mod_path).ok()?;

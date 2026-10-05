@@ -1,45 +1,39 @@
 # qqshark
 
-QQNT 零注入跨平台抓包工具喵～
+QQNT 协议取证的妙妙小工具喵～。
 
-非侵入式：只读进程内存 / 只读打开数据库锁 / 只从网卡抓包，不注入、不 hook、不修改 QQ。
+**不注入、不 hook、不改动 QQ**，只读地扫描进程内存拿到会话密钥（a2/d2/d2key），再直接读网卡解密 MSF 流量。
 
-## 功能
+- 密钥来源：运行时扫描 QQ 主进程（`wrapper.node`）的内存，用 C++ RTTI 自举定位 `SessionForNt` 实例后读取字段——零硬编码 RVA、零注入。
+- 抓包来源：libpcap 读网卡 → TCP 重组 → MSF 帧解密（TEA）。网卡与端口默认 `auto` 自动识别。
 
-- `scan`：运行时扫描某 pid 的 a2/d2/d2key（RTTI 自举，零硬编码 RVA）
-- `procs`：枚举全部在线 QQ 进程并映射到 UIN（解密 login.db + 文件锁探测）
-- `capture`：原始抓包 + MSF 帧解密（TUI 方框输出，Ctrl+C/ESC 结束）
-- `live`：一条龙，先扫进程与 UIN，再自动取 d2key 抓包
-- `decode`：在终端展开一段 hex（hexdump + TEA 解密（可选）+ protobuf/JCE 解析）
-
-## 平台支持
-
-| 平台 | 内存扫描 (scan) | 抓包 (capture) | 数据目录/UIN 映射 |
-| --- | --- | --- | --- |
-| Linux | `sudo`（或 CAP_SYS_PTRACE）| `sudo`（或 CAP_NET_RAW）| 支持 |
-| Windows | 管理员终端 | 管理员终端 + Npcap | 支持 |
-| macOS | `sudo` 且关闭 SIP | `sudo`（无需关 SIP）| 支持 |
-
-### macOS 说明
-
-- 抓包：macOS 的 BPF 设备（`/dev/bpf*`）默认仅 root 可读，用 `sudo` 运行即可，不需要关闭 SIP。默认网卡 `auto` 会自动选默认路由出口（通常是 `en0`）。
-- 内存扫描：QQ 启用了强化运行时（hardened runtime），即使 root，`task_for_pid` 也会被 `taskgated` 拒绝（`kern_return=5`）。只有关闭 SIP 后才可读取：重启进恢复模式执行 `csrutil disable`，再重启。抓包不受此限制。
-- MSF 端口由服务器下发、**会变**（实测见过 `80`/`443`/`14000`），因此 `-p/--port` 默认 `auto`，按 MSF 帧签名在运行时自动识别；也可显式指定，如 `-p 14000`。
-
-## 用法
+## 命令
 
 ```sh
-# 扫描密钥（macOS 需 sudo + 关 SIP）
-sudo ./qqshark scan --pid <QQ_PID>
+# 扫描密钥（macOS 需 sudo + 关 SIP；Linux 用 sudo）
+qqshark scan [--pid <PID>] [--json]
 
-# 枚举进程与 UIN
-sudo ./qqshark procs
+# 枚举在线 QQ 进程并映射 UIN
+qqshark procs [--json]
 
-# 抓包（自动选网卡、自动识别端口）
-sudo ./qqshark capture            # 默认 -i auto -p <平台默认>
-sudo ./qqshark capture -p auto    # 端口也自动识别
-sudo ./qqshark capture -i en0 -p 14000 --d2key <32hex>
+# 抓包（默认自动选网卡、自动识别端口、完整 hexdump + 展开正文）
+qqshark capture [-i auto] [-p auto] [--d2key <32hex>] [--pid <PID>] \
+                [-w out.pcap] [--only-head] [--no-expand] [-n <N>]
 
-# 一条龙
-sudo ./qqshark live
+# 一条龙：先扫进程与 UIN，再取 d2key 抓包
+qqshark live [-i auto] [-p auto] [--pid <PID>] [-w out.pcap] \
+             [--only-head] [--no-expand] [-n <N>]
+
+# 在终端展开一段 hex（可先按 d2key 做 TEA 解密）
+qqshark decode <HEX|- > [--d2key <32hex>] [--only-head] [--no-expand]
 ```
+
+关键参数：
+
+- `-i, --iface`：抓包接口，默认 `auto`（自动选默认路由出口网卡），也可显式填 `en0`/`wlan0` 等。
+- `-p, --port`：MSF 端口，默认 `auto`（按 MSF 帧签名运行时识别），也可写 `80`/`443`/`14000`。
+- `--d2key`：直接给 32 字符 hex 密钥；省略则由 `--pid` 自动扫描。
+- `--only-head`（别名 `--no-hex`）：只显示 hexdump 前 128 字节预览；默认打印完整 hexdump。
+- `--no-expand`：不展开正文的 protobuf/JCE 树；默认展开。
+
+收发包用 TUI 方框展示，Ctrl+C 或 ESC 结束。

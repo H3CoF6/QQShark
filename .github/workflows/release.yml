@@ -1,0 +1,122 @@
+name: release
+
+# 构建 5 个平台的产物并挂到 GitHub Release（推送 v* tag 触发）。
+#
+# 为什么是这个形状：
+#   * rusqlite 用 `bundled` 的 SQLite 单文件 amalgamation，每个 target 只需要
+#     一个 C 编译器——几秒，而不是 sqlcipher/openssl 那种十几分钟的折腾。
+#   * pcap 在 Linux 上需要 libpcap（原生 apt 装；arm64 交叉编译走 Cross.toml
+#     在容器里装），macOS 用系统自带，Windows 用仓库内 Npcap 导入库。
+#   * arm64 交叉产物只构建、不测试（runner 无 arm 硬件跑 x64）；x64 原生构建+测试。
+#   * macOS：一个 arm64 runner 同时产出两个 apple-darwin 架构（Apple 工具链原生
+#     交叉 x86_64<->aarch64，cc 能自行找到 SDK）。
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: false
+            test: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+            test: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+            test: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross: false
+            test: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cross: false
+            test: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Linux 抓包依赖 libpcap（原生构建时从 apt 装；arm64 交叉由 Cross.toml 处理）。
+      - name: Install libpcap (Linux, native)
+        if: matrix.cross == false && startsWith(matrix.target, 'x86_64-unknown-linux')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Test (x64 only)
+        if: matrix.test
+        run: cargo test --release --target ${{ matrix.target }}
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="qqshark-${{ matrix.target }}"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cp "target/${{ matrix.target }}/release/qqshark.exe" "${out}.exe"
+          else
+            cp "target/${{ matrix.target }}/release/qqshark" "${out}"
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qqshark-${{ matrix.target }}
+          path: qqshark-${{ matrix.target }}*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

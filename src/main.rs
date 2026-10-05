@@ -27,7 +27,7 @@ use clap::{Parser, Subcommand};
     long_about = "非侵入式逆向/取证 QQ NT 协议。\n\
     · scan    运行时扫描某 pid 的 a2/d2/d2key（RTTI 自举，零硬编码 RVA）\n\
     · procs   枚举全部在线 QQ 进程并映射到 UIN（login.db 解密 + 锁探测）\n\
-    · capture 原始抓包 + MSF 帧解密（TUI 方框输出，默认 hexdump 前 128 字节预览，Ctrl+C/ESC 结束）\n\
+    · capture 原始抓包 + MSF 帧解密（TUI 方框输出，默认完整 hexdump + 展开，Ctrl+C/ESC 结束）\n\
     · live    一条龙：先扫进程与 UIN，再自动取 d2key 抓包\n\
     · decode  在终端展开一段 hex：hexdump + TEA 解密（可选）+ protobuf/JCE 完整解析"
 )]
@@ -57,12 +57,12 @@ struct DecodeArgs {
     /// 帧密文的 d2key（32 字符 hex）。提供则先按 MSF 帧 TEA 解密再解析
     #[arg(long)]
     d2key: Option<String>,
-    /// 打印完整 hexdump（不截断）
-    #[arg(long)]
-    hex: bool,
-    /// 完整解析正文的 protobuf/JCE 树（不截断）
-    #[arg(long)]
-    expand: bool,
+    /// 只显示 hexdump 预览（前 128 字节），不打印完整 hexdump
+    #[arg(long = "only-head", visible_alias = "no-hex")]
+    only_head: bool,
+    /// 不展开正文的 protobuf/JCE 树（默认展开）
+    #[arg(long = "no-expand")]
+    no_expand: bool,
 }
 
 #[derive(clap::Args)]
@@ -90,8 +90,8 @@ struct ProcsArgs {
 
 #[derive(clap::Args)]
 struct CapArgs {
-    /// 抓包接口：`auto`（默认）自动选默认出口网卡；也可填 en0/wlan0/eth0 等，
-    /// Linux 或 TUN 场景可填 "any"/"Meta"；Windows 填 Npcap 设备名
+    /// 抓包接口：`auto`（默认）自动识别默认出口网卡；也可显式填 en0/wlan0/eth0
+    /// 等（Windows 填 Npcap 设备名）
     #[arg(short, long, default_value = DEFAULT_IFACE)]
     iface: String,
     /// MSF 服务端口；`auto`（默认）/`0` = 按流量自动识别，也可写 80/443/14000 等
@@ -109,12 +109,12 @@ struct CapArgs {
     /// 把原始包写入 pcap 文件
     #[arg(short, long)]
     write: Option<PathBuf>,
-    /// 额外打印完整的明文 hexdump（不截断）
-    #[arg(long)]
-    hex: bool,
-    /// 完整展开正文的 protobuf/JCE 树（不截断）
-    #[arg(long)]
-    expand: bool,
+    /// 只显示 hexdump 预览（前 128 字节），不打印完整 hexdump（默认打印完整）
+    #[arg(long = "only-head", visible_alias = "no-hex")]
+    only_head: bool,
+    /// 不展开正文的 protobuf/JCE 树（默认展开）
+    #[arg(long = "no-expand")]
+    no_expand: bool,
     /// 抓到 N 个帧后退出（调试用）
     #[arg(short = 'n', long)]
     count: Option<usize>,
@@ -122,8 +122,8 @@ struct CapArgs {
 
 #[derive(clap::Args)]
 struct LiveArgs {
-    /// 抓包接口：`auto`（默认）自动选默认出口网卡；也可填 en0/wlan0/eth0 等，
-    /// Linux 或 TUN 场景可填 "any"/"Meta"；Windows 填 Npcap 设备名
+    /// 抓包接口：`auto`（默认）自动识别默认出口网卡；也可显式填 en0/wlan0/eth0
+    /// 等（Windows 填 Npcap 设备名）
     #[arg(short, long, default_value = DEFAULT_IFACE)]
     iface: String,
     /// MSF 服务端口；`auto`（默认）/`0` = 按流量自动识别，也可写 80/443/14000 等
@@ -136,10 +136,12 @@ struct LiveArgs {
     data_root: Option<PathBuf>,
     #[arg(short, long)]
     write: Option<PathBuf>,
-    #[arg(long)]
-    hex: bool,
-    #[arg(long)]
-    expand: bool,
+    /// 只显示 hexdump 预览（前 128 字节），不打印完整 hexdump（默认打印完整）
+    #[arg(long = "only-head", visible_alias = "no-hex")]
+    only_head: bool,
+    /// 不展开正文的 protobuf/JCE 树（默认展开）
+    #[arg(long = "no-expand")]
+    no_expand: bool,
     #[arg(short = 'n', long)]
     count: Option<usize>,
 }
@@ -238,10 +240,20 @@ fn cmd_decode(a: DecodeArgs) -> anyhow::Result<()> {
         a.input
     };
     let bytes = hex_decode_loose(&raw)?;
+    // 默认完整 hexdump + 完整展开；`--only-head` / `--no-expand` 可分别关闭。
+    let hex = !a.only_head;
+    let expand = !a.no_expand;
 
     ui::section("输入");
     ui::field("字节数", &bytes.len().to_string());
-    ui::field("hexdump[0..128]", "预览（截断，--hex 看完整）");
+    ui::field(
+        "hexdump[0..128]",
+        if hex {
+            "预览（截断，完整见下方）"
+        } else {
+            "预览（截断，--only-head 仅预览）"
+        },
+    );
     print_indented(&ui::hexdump_lines(&bytes, 16, Some(128)));
 
     // 可选：TEA 解密。既能吃完整 MSF 帧（自动取其密文），也能吃裸密文。
@@ -264,15 +276,15 @@ fn cmd_decode(a: DecodeArgs) -> anyhow::Result<()> {
         print_indented(&ui::hexdump_lines(&plain, 16, Some(128)));
     }
 
-    // --hex：完整 hexdump（明文优先，否则原始字节），不截断。
-    if a.hex {
+    // 默认：完整 hexdump（明文优先，否则原始字节），不截断。`--only-head` 关闭。
+    if hex {
         let target = &plain;
         ui::section(&format!("hexdump（完整 {} 字节）", target.len()));
         print_indented(&ui::hexdump_lines(target, 16, None));
     }
 
-    // --expand：完整解析 protobuf/JCE 树，不截断。
-    if a.expand {
+    // 默认：完整解析 protobuf/JCE 树，不截断。`--no-expand` 关闭。
+    if expand {
         ui::section("展开");
         // 1) 尝试当作 SsoPacker 明文取 body（仅在确实识别出 SSO 头时才走这条）
         if let Some(d) = frame::decode_plain(&plain)
@@ -487,8 +499,8 @@ fn cmd_capture(a: CapArgs) -> anyhow::Result<()> {
         port: a.port,
         d2key,
         write: a.write,
-        hex: a.hex,
-        expand: a.expand,
+        hex: !a.only_head,
+        expand: !a.no_expand,
         count: a.count,
     })
 }
@@ -543,8 +555,8 @@ fn cmd_live(a: LiveArgs) -> anyhow::Result<()> {
         port: a.port,
         d2key,
         write: a.write,
-        hex: a.hex,
-        expand: a.expand,
+        hex: !a.only_head,
+        expand: !a.no_expand,
         count: a.count,
     })
 }

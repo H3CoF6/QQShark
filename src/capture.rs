@@ -409,8 +409,8 @@ fn open_error_hint(iface: &str, e: &str) -> String {
              1) 直接提权重跑： `sudo ./qqshark capture -i {iface}`\n\
              2) 或给二进制放开规则（免 sudo）：\n\
                 `sudo setcap cap_net_raw,cap_net_admin+eip $(readlink -f ./qqshark)`\n\
-             3) 若使用 Clash/Meta TUN：QQ 流量会出现在 `Meta` 接口上，用 `-i Meta`；\n\
-                否则用物理网卡（`-i any` / `-i wlan0` / `-i eth0`）即可，无需 TUN。"
+             3) 接口一般无需手动指定：`-i auto`（默认）会自动选默认路由出口网卡；\n\
+                确需指定时填物理网卡名（如 `-i wlan0` / `-i eth0`）即可。"
         )
     }
     #[cfg(target_os = "macos")]
@@ -613,17 +613,17 @@ fn emit_frame(opts: &CaptureOpts, v: &FrameView<'_>) {
     let content = plain.unwrap_or(f);
     let what = if plain.is_some() { "plain" } else { "raw" };
     body.push(format!(
-        "{what} hexdump[0..128]：预览（截断，--hex 看完整）"
+        "{what} hexdump[0..128]：预览（截断；默认下方还有完整 hexdump，--only-head 可关闭）"
     ));
     body.extend(ui::hexdump_lines(content, 16, Some(128)));
 
-    // --hex：完整 hexdump，不截断。
+    // 默认：完整 hexdump，不截断（`--only-head` 关闭）。
     if opts.hex {
         body.push(format!("{what} hexdump（完整 {} 字节）：", content.len()));
         body.extend(ui::hexdump_lines(content, 16, None));
     }
 
-    // --expand：完整解析 protobuf/JCE 树，不截断。
+    // 默认：完整解析 protobuf/JCE 树，不截断（`--no-expand` 关闭）。
     if opts.expand {
         match decoded {
             Some(d) if !d.body.is_empty() => match codec::decode_auto(&d.body) {

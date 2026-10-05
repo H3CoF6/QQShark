@@ -1,0 +1,8 @@
+# cross 交叉编译容器：给每个 target 的容器预装系统依赖。
+#
+# Linux arm64 用 `cross`（Docker）；容器基础镜像里没有 libpcap，bundled SQLite
+# 又需要一个 C 编译器，因此在构建前于容器内装好 libpcap-dev。
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    "apt-get update && apt-get install -y --no-install-recommends libpcap-dev",
+]
