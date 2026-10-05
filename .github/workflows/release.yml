@@ -5,8 +5,10 @@ name: release
 # 为什么是这个形状：
 #   * rusqlite 用 `bundled` 的 SQLite 单文件 amalgamation，每个 target 只需要
 #     一个 C 编译器——几秒，而不是 sqlcipher/openssl 那种十几分钟的折腾。
-#   * pcap 在 Linux 上需要 libpcap（原生 apt 装；arm64 交叉编译走 Cross.toml
-#     在容器里装），macOS 用系统自带，Windows 用仓库内 Npcap 导入库。
+#   * pcap 在 Linux 上需要 libpcap。为了让产物自包含（不依赖用户机器上的
+#     libpcap.so.*），x64 在这里从源码构建一个最小静态库，arm64 交叉由 Cross.toml
+#     在容器里装好静态库；两者都通过 LIBPCAP_LIBDIR 让 pcap crate 静态链接。
+#     macOS 用系统自带，Windows 用仓库内 Npcap 导入库。
 #   * arm64 交叉产物只构建、不测试（runner 无 arm 硬件跑 x64）；x64 原生构建+测试。
 #   * macOS：一个 arm64 runner 同时产出两个 apple-darwin 架构（Apple 工具链原生
 #     交叉 x86_64<->aarch64，cc 能自行找到 SDK）。
@@ -62,12 +64,25 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # Linux 抓包依赖 libpcap（原生构建时从 apt 装；arm64 交叉由 Cross.toml 处理）。
-      - name: Install libpcap (Linux, native)
+      # 静态链接 libpcap：发行版自带的 libpcap.a 会拖入 ibverbs/systemd/dbus 等
+      # 一堆依赖，所以从源码构建一个禁掉可选后端的最小静态库，放到只含 .a 的目录，
+      # 再用 LIBPCAP_LIBDIR 指给它（链接器会在系统目录之前命中这里的 .a）。
+      - name: Build static libpcap (Linux, native)
         if: matrix.cross == false && startsWith(matrix.target, 'x86_64-unknown-linux')
         run: |
+          set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y libpcap-dev
+          sudo apt-get install -y flex bison
+          curl -fsSL https://www.tcpdump.org/release/libpcap-1.10.4.tar.gz -o /tmp/libpcap.tar.gz
+          tar xzf /tmp/libpcap.tar.gz -C /tmp
+          cd /tmp/libpcap-1.10.4
+          ./configure --disable-shared --without-libnl --disable-dbus \
+            --disable-rdma --disable-bluetooth --disable-usb --disable-netmap \
+            CFLAGS=-fPIC
+          make -j"$(nproc)"
+          mkdir -p "$GITHUB_WORKSPACE/.libpcap-static"
+          cp libpcap.a "$GITHUB_WORKSPACE/.libpcap-static/"
+          echo "LIBPCAP_LIBDIR=$GITHUB_WORKSPACE/.libpcap-static" >> "$GITHUB_ENV"
 
       - name: Install cross
         if: matrix.cross
@@ -79,6 +94,10 @@ jobs:
 
       - name: Build (cross)
         if: matrix.cross
+        env:
+          # Cross.toml 的 pre-build 已把 arm64 静态库放到 /opt/libpcap-static，
+          # 这里透传路径给 pcap crate。
+          LIBPCAP_LIBDIR: /opt/libpcap-static
         run: cross build --release --target ${{ matrix.target }}
 
       - name: Test (x64 only)

@@ -1,8 +1,21 @@
-# cross 交叉编译容器：给每个 target 的容器预装系统依赖。
+# cross 交叉编译容器：给 arm64 容器预装/构建系统依赖。
 #
-# Linux arm64 用 `cross`（Docker）；容器基础镜像里没有 libpcap，bundled SQLite
-# 又需要一个 C 编译器，因此在构建前于容器内装好 libpcap-dev。
+# Linux arm64 用 `cross`（Docker）。产物要**静态链接 libpcap**（不依赖用户机器上的
+# libpcap.so.*），而 Ubuntu 自带的 `libpcap.a` 不是位置无关代码（非 -fPIC），
+# 链接 `-pie` 的 Rust 二进制时会出现 R_AARCH64_ADR_PREL_PG_HI21 relocation 错误。
+# 所以在容器里用交叉编译器从源码构建一个带 -fPIC 的最小静态库，放到
+# /opt/libpcap-static，配合 libpcap 的 `LIBPCAP_LIBDIR` 让 pcap crate 静态链接。
+#
+# 注意 `libpcap-dev` 在这里没用：它是 Architecture: all 的元包，apt 里
+# `libpcap-dev:arm64` 没有安装候选；真正带库的是 `libpcap0.8-dev`，但我们直接
+# 从源码构建，版本可控且能拿到 -fPIC。
+[build.env]
+passthrough = ["LIBPCAP_LIBDIR"]
+
 [target.aarch64-unknown-linux-gnu]
 pre-build = [
-    "apt-get update && apt-get install -y --no-install-recommends libpcap-dev",
+    "apt-get update && apt-get install -y --no-install-recommends build-essential flex bison curl ca-certificates",
+    "curl -fsSL https://www.tcpdump.org/release/libpcap-1.10.4.tar.gz -o /tmp/libpcap.tar.gz && tar xzf /tmp/libpcap.tar.gz -C /tmp",
+    "cd /tmp/libpcap-1.10.4 && ./configure --host=aarch64-linux-gnu --disable-shared --without-libnl --disable-dbus --disable-rdma --disable-bluetooth --disable-usb --disable-netmap CC=aarch64-linux-gnu-gcc CFLAGS=-fPIC && make -j\"$(nproc)\"",
+    "mkdir -p /opt/libpcap-static && cp /tmp/libpcap-1.10.4/libpcap.a /opt/libpcap-static/",
 ]
