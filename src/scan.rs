@@ -1128,7 +1128,7 @@ mod tests {
     #[test]
     fn probe_picks_pointer_at_plus_0_layout_b() {
         let obj = 0x2000u64;
-        let data_addr = 0x13c0367_9900u64;
+        let data_addr = 0x013c_0367_9900_u64;
         let key = b"3d2c69392a38707d762c7370654b3a4e";
         let mem = FakeMem::default()
             .word(obj, data_addr) // +0 数据指针
